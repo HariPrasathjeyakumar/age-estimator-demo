@@ -1,4 +1,5 @@
 import os
+import gc
 import cv2
 import gdown
 import matplotlib.pyplot as plt
@@ -90,7 +91,7 @@ def crop_and_align_face(image_pil, target_size=(256, 256)):
 # ============================================================
 # MC DROPOUT PREDICTION ENGINE (+ TTA)
 # ============================================================
-def predict_age(image_tensor, num_passes=10, use_tta=True):
+def predict_age(image_tensor, num_passes=5, use_tta=True):
     age_bins = np.arange(101)
     all_preds = []
 
@@ -107,13 +108,14 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
 
     ages = [p[0] for p in all_preds]
     mean_probs = np.mean([p[1] for p in all_preds], axis=0)
+    
+    gc.collect()  # Flush intermediate prediction arrays from RAM
     return float(np.mean(ages)), float(np.std(ages)), mean_probs
 
 # ============================================================
 # GRAPH-NATIVE GRAD-CAM (K3 & DTYPE MATCHED)
 # ============================================================
 def generate_gradcam(image_tensor):
-    # 1. Locate inner backbone submodel and target layer
     backbone = None
     target_layer = None
 
@@ -132,7 +134,6 @@ def generate_gradcam(image_tensor):
                 target_layer = layer
                 break
 
-    # 2. Extract feature maps through sub-model
     if backbone is not None:
         backbone_grad_model = tf.keras.Model(
             inputs=backbone.inputs,
@@ -166,18 +167,15 @@ def generate_gradcam(image_tensor):
             age_bins = tf.cast(tf.range(num_classes), dtype=predictions.dtype)
             expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
 
-    # 3. Compute gradients of expected age w.r.t target layer activations
     grads = tape.gradient(expected_age, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
 
-    # 4. Generate normalized heatmap matrix
     heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
 def create_pil_overlay(original_tensor_crop, heatmap, alpha=0.45):
-    """Blends 2D heatmap onto face crop using PIL/Matplotlib (Zero OpenCV)."""
     base_img = np.clip(original_tensor_crop[0], 0, 255).astype(np.uint8)
     
     heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
@@ -192,19 +190,18 @@ def create_pil_overlay(original_tensor_crop, heatmap, alpha=0.45):
     return np.clip(blended, 0, 255).astype(np.uint8)
 
 def generate_feature_explanation(mean_age):
-    """Maps predicted age tier to dominant facial feature influences."""
     if mean_age < 18:
         primary_features = "Facial proportions, smooth skin texture, and eye-to-face distance ratio."
         biological_markers = "Minimal fine lines; primary reliance on cranial shape and facial compact ratio."
     elif 18 <= mean_age < 35:
-        primary_features = "Jawline definition, skin tautness, periocular (eye area) clarity, and nasolabial symmetry."
-        biological_markers = "Peak muscle tone, subtle early expression lines around the eyes/mouth."
+        primary_features = "Jawline definition, skin tautness, periocular clarity, and nasolabial symmetry."
+        biological_markers = "Peak muscle tone, subtle early expression lines around eyes/mouth."
     elif 35 <= mean_age < 55:
         primary_features = "Forehead expression lines, nasolabial folds, cheek volume, and subtle under-eye texture."
-        biological_markers = "Gradual loss of skin elasticity, deepening expression creases, structural volume shifts."
+        biological_markers = "Gradual loss of skin elasticity, deepening expression creases, volume shifts."
     else:
-        primary_features = "Deep forehead furrows, periorbital (crow's feet) wrinkles, neck skin laxity, and tissue sagging."
-        biological_markers = "Prominent structural remodeling, loss of dermal thickness, and pronounced facial creasing."
+        primary_features = "Deep forehead furrows, periorbital wrinkles, neck skin laxity, and tissue sagging."
+        biological_markers = "Prominent structural remodeling, loss of dermal thickness, pronounced creasing."
 
     return primary_features, biological_markers
 
@@ -232,7 +229,7 @@ if uploaded_file:
         st.warning(w)
 
     if tensor is not None:
-        mean_age, std_age, mean_probs = predict_age(tensor, num_passes=10, use_tta=True)
+        mean_age, std_age, mean_probs = predict_age(tensor, num_passes=5, use_tta=True)
 
         with col1:
             st.image(image_pil, caption="Uploaded Input", use_container_width=True)
@@ -283,5 +280,7 @@ if uploaded_file:
                     "the neural network's final Conv2D layers heavily weighted facial geometry and dermal texture "
                     "in the highlighted warm regions to produce this probability distribution."
                 )
+
+        gc.collect()  # Clean memory after completing full UI render
     else:
         st.error("Face detection failed. Please upload a clear photo with a visible face.")
