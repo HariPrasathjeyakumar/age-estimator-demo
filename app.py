@@ -1,18 +1,27 @@
 # app.py
-import streamlit as st
-import numpy as np
-import tensorflow as tf
-from PIL import Image
-from mtcnn import MTCNN
-import matplotlib.pyplot as plt
+import os
 import cv2
+import gdown
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+import streamlit as st
+import tensorflow as tf
+from mtcnn import MTCNN
+
+MODEL_PATH = "best_soft_label_model.keras"
+GDRIVE_FILE_ID = "1oN5aI1HHgZNga2qZ5ADDXzQBoW0bI8U-"
 
 # ============================================================
-# CACHED MODEL LOADING (loads once, not on every interaction)
+# CACHED MODEL & DETECTOR LOADING (AUTO-DOWNLOADS FROM GDRIVE)
 # ============================================================
 @st.cache_resource
 def load_model():
-    model = tf.keras.models.load_model("best_soft_label_model.keras", compile=False)
+    if not os.path.exists(MODEL_PATH):
+        with st.spinner("Downloading model weights from Google Drive..."):
+            url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+            gdown.download(url, MODEL_PATH, quiet=False)
+    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     return model
 
 @st.cache_resource
@@ -20,9 +29,9 @@ def load_detector():
     return MTCNN()
 
 model = load_model()
-detector = MTCNN()
+detector = load_detector()
 
-# Patch dropout for MC Dropout uncertainty (same as your validated approach)
+# Patch dropout for MC Dropout uncertainty
 def patch_dropout_layers(layer_container):
     layers = getattr(layer_container, 'layers', getattr(layer_container, 'submodules', []))
     for layer in layers:
@@ -37,7 +46,7 @@ def patch_dropout_layers(layer_container):
 patch_dropout_layers(model)
 
 # ============================================================
-# QUALITY GATING (borrowed idea, cheap addition)
+# QUALITY GATING
 # ============================================================
 def check_image_quality(face_crop_array):
     gray = cv2.cvtColor(face_crop_array, cv2.COLOR_RGB2GRAY)
@@ -50,7 +59,7 @@ def check_image_quality(face_crop_array):
     return warnings
 
 # ============================================================
-# FACE DETECTION + PREPROCESSING (matches training exactly)
+# FACE DETECTION + PREPROCESSING (MTCNN + 20% PADDING)
 # ============================================================
 def crop_and_align_face(image_pil, target_size=(256, 256)):
     img_array = np.array(image_pil.convert('RGB'))
@@ -70,7 +79,7 @@ def crop_and_align_face(image_pil, target_size=(256, 256)):
     warnings = check_image_quality(face_crop)
 
     resized = cv2.resize(face_crop, target_size)
-    normalized = resized.astype(np.float32) / 255.0  # matches your validated training normalization
+    normalized = resized.astype(np.float32) / 255.0
     return np.expand_dims(normalized, axis=0), (x1, y1, x2, y2), warnings
 
 # ============================================================
@@ -94,7 +103,7 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
     return float(np.mean(ages)), float(np.std(ages)), mean_probs
 
 # ============================================================
-# GRAD-CAM
+# GRAD-CAM EXPLAINABILITY
 # ============================================================
 def generate_gradcam(image_tensor, model, last_conv_layer_name="top_conv"):
     grad_model = tf.keras.models.Model(
@@ -119,7 +128,7 @@ def overlay_gradcam(original_img_array, heatmap):
     return overlay
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT INTERFACE
 # ============================================================
 st.set_page_config(page_title="Age Estimation AI", page_icon="👤", layout="wide")
 st.title("🎯 AI Age Estimation System")
@@ -131,7 +140,7 @@ if uploaded_file:
     image_pil = Image.open(uploaded_file)
     col1, col2 = st.columns(2)
 
-    with st.spinner("Analyzing..."):
+    with st.spinner("Analyzing image..."):
         tensor, box, warnings = crop_and_align_face(image_pil)
 
     for w in warnings:
@@ -141,7 +150,7 @@ if uploaded_file:
         mean_age, std_age, mean_probs = predict_age(tensor, num_passes=10, use_tta=True)
 
         with col1:
-            st.image(image_pil, caption="Uploaded Image", use_column_width=True)
+            st.image(image_pil, caption="Uploaded Image", use_container_width=True)
 
         with col2:
             st.metric("Predicted Age", f"{mean_age:.1f} years")
@@ -152,7 +161,7 @@ if uploaded_file:
             ax.axvline(mean_age, color='red', linestyle='--', label=f'Predicted: {mean_age:.1f}')
             ax.fill_between(np.arange(101), mean_probs, alpha=0.2,
                             where=(np.arange(101) >= mean_age-std_age) & (np.arange(101) <= mean_age+std_age))
-            ax.set_xlabel("Age")
+            ax.set_xlabel("Age Class")
             ax.set_ylabel("Probability")
             ax.legend()
             st.pyplot(fig)
@@ -161,10 +170,10 @@ if uploaded_file:
             heatmap = generate_gradcam(tensor, model)
             face_crop_display = (tensor[0] * 255).astype(np.uint8)
             overlay = overlay_gradcam(face_crop_display, heatmap)
-            st.image(overlay, caption="Model attention (red = high influence)", use_column_width=True)
-            st.caption("Confirms the model focuses on facial aging features (eyes, forehead, skin texture)")
+            st.image(overlay, caption="Model attention heatmap (red = primary influence)", use_container_width=True)
+            st.caption("Confirms feature extraction focus on structural facial regions (eyes, forehead, mouth area).")
     else:
-        st.error("Could not process this image. Please try a clearer photo with a visible face.")
+        st.error("Could not process this image. Please upload a clear photo with a visible face.")
 
 st.markdown("---")
-st.caption("⚠️ This tool provides an AI-generated estimate, not a verified or legal age determination.")
+st.caption("⚠️ This application provides an AI estimate for research purposes and is not a legally verified age check.")
