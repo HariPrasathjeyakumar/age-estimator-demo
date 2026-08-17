@@ -114,33 +114,73 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
 # ============================================================
 # GRAPH-NATIVE GRAD-CAM (DEX EXPECTED VALUE GRADIENT)
 # ============================================================
-import tensorflow as tf
+def generate_gradcam(image_tensor):
+    # 1. Locate inner backbone submodel and the target convolutional layer
+    backbone = None
+    target_layer = None
 
-def generate_gradcam(img_array, model, last_conv_layer_name, pred_index=None):
-    # Ensure the model outputs intermediate activations correctly
-    grad_model = tf.keras.Model(
-        inputs=model.inputs,
-        outputs=[model.get_layer(last_conv_layer_name).output, model.output]
-    )
+    for layer in model.layers:
+        if hasattr(layer, 'get_layer'):
+            try:
+                target_layer = layer.get_layer('top_conv')
+                backbone = layer
+                break
+            except ValueError:
+                pass
 
-    with tf.GradientTape() as tape:
-        last_conv_layer_output, preds = grad_model(img_array)
-        if pred_index is None:
-            pred_index = tf.argmax(preds[0])
-        class_channel = preds[:, pred_index]
+    if backbone is None or target_layer is None:
+        # Fallback to direct top_conv or last Conv2D
+        for layer in reversed(model.layers):
+            if layer.name == 'top_conv' or isinstance(layer, tf.keras.layers.Conv2D):
+                target_layer = layer
+                break
 
-    # Calculate gradients of top predicted class w.r.t. feature map
-    grads = tape.gradient(class_channel, last_conv_layer_output)
+    # 2. Extract feature-maps through a lightweight backbone sub-model
+    if backbone is not None:
+        backbone_grad_model = tf.keras.Model(
+            inputs=backbone.inputs,
+            outputs=[target_layer.output, backbone.output]
+        )
+        
+        # Identify head layers dynamically
+        backbone_idx = model.layers.index(backbone)
+        head_layers = model.layers[backbone_idx + 1:]
+        gap_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.GlobalAveragePooling2D))
+        gmp_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.GlobalMaxPooling2D))
+        concat_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.Concatenate))
+        dense_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.Dense))
+
+        with tf.GradientTape() as tape:
+            # Evaluate feature outputs in eager execution
+            conv_outputs, bb_outputs = backbone_grad_model(image_tensor, training=False)
+            tape.watch(conv_outputs)
+
+            # Pass eager activations through the classification head
+            gap_out = gap_layer(bb_outputs)
+            gmp_out = gmp_layer(bb_outputs)
+            concat_out = concat_layer([gap_out, gmp_out])
+            predictions = dense_layer(concat_out)
+
+            # DEX expected age evaluation
+            age_bins = tf.range(101, dtype=tf.float32)
+            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+    else:
+        # Fallback for standard flat models
+        grad_model = tf.keras.Model(inputs=model.inputs, outputs=[target_layer.output, model.output])
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = grad_model(image_tensor, training=False)
+            age_bins = tf.range(101, dtype=tf.float32)
+            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+
+    # 3. Compute gradients of expected age w.r.t target layer activations
+    grads = tape.gradient(expected_age, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
 
-    last_conv_layer_output = last_conv_layer_output[0]
-    heatmap = last_conv_layer_output @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    
-    # Normalize heatmap
-    heatmap = tf.maximum(heatmap, 0) / tf.math.reduce_max(heatmap)
-    return heatmap.numpy()
-    
+    # 4. Generate normalized heatmap matrix
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    return heatmap.numpy()    
 def overlay_gradcam(original_img_array, heatmap):
     heatmap_resized = cv2.resize(heatmap, (original_img_array.shape[1], original_img_array.shape[0]))
     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
