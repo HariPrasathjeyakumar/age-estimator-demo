@@ -16,10 +16,7 @@ GDRIVE_FILE_ID = "1oN5aI1HHgZNga2qZ5ADDXzQBoW0bI8U-"
 # MC DROPOUT PATCHING & CACHED MODEL LOADING
 # ============================================================
 def patch_mc_dropout(model_obj):
-    """
-    Recursively patches all Dropout layers to force training=True during inference.
-    Leaves BatchNorm in evaluation mode to prevent distribution drift.
-    """
+    """Recursively patches Dropout layers to remain active during inference."""
     patched_count = 0
 
     def _recursive_patch(container):
@@ -40,10 +37,6 @@ def patch_mc_dropout(model_obj):
 
 @st.cache_resource
 def load_model_and_verify():
-    """
-    Loads weights, applies MC Dropout patch, and executes a 5-pass startup test
-    to guarantee stochastic inference inside Streamlit's runtime.
-    """
     if not os.path.exists(MODEL_PATH):
         with st.spinner("Downloading model weights from Google Drive..."):
             url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
@@ -52,8 +45,8 @@ def load_model_and_verify():
     loaded_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
     num_patched = patch_mc_dropout(loaded_model)
 
-    # Startup Diagnostic: Verify variance across 5 stochastic passes
-    dummy_input = np.random.rand(1, 256, 256, 3).astype(np.float32)
+    # Diagnostic pass with float32 unscaled range [0, 255]
+    dummy_input = np.random.rand(1, 256, 256, 3).astype(np.float32) * 255.0
     age_bins = np.arange(101)
     test_preds = [
         float(np.sum(age_bins * loaded_model(dummy_input, training=False).numpy()[0]))
@@ -67,49 +60,34 @@ def load_model_and_verify():
 def load_detector():
     return MTCNN()
 
-# Initialize model and detector
 model, patched_layers_count, startup_var = load_model_and_verify()
 detector = load_detector()
-
-# ============================================================
-# QUALITY GATING
-# ============================================================
-def check_image_quality(face_crop_array):
-    gray = cv2.cvtColor(face_crop_array, cv2.COLOR_RGB2GRAY)
-    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    warnings = []
-    if blur_score < 50:
-        warnings.append(f"⚠️ Image appears blurry (Laplacian Variance: {blur_score:.1f})")
-    if face_crop_array.shape[0] < 80 or face_crop_array.shape[1] < 80:
-        warnings.append("⚠️ Low face resolution (< 80x80 px) — accuracy may be impacted")
-    return warnings
 
 # ============================================================
 # FACE DETECTION & STANDARDIZED PREPROCESSING
 # ============================================================
 def crop_and_align_face(image_pil, target_size=(256, 256)):
+    # Standard RGB pipeline matching Kaggle
     img_array = np.array(image_pil.convert('RGB'))
     results = detector.detect_faces(img_array)
 
     if not results:
         return None, None, ["⚠️ No face detected — please upload a clearer face image"]
 
-    # Select largest detected face bounding box
     best_face = max(results, key=lambda r: r['box'][2] * r['box'][3])
     x, y, w, h = best_face['box']
     x, y = max(0, x), max(0, y)
 
-    # 20% padding expansion to match training pipeline
     pad_x, pad_y = int(w * 0.20), int(h * 0.20)
     x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
     x2, y2 = min(img_array.shape[1], x + w + pad_x), min(img_array.shape[0], y + h + pad_y)
 
     face_crop = img_array[y1:y2, x1:x2]
-    warnings = check_image_quality(face_crop)
-
     resized = cv2.resize(face_crop, target_size)
-    normalized = resized.astype(np.float32) / 255.0  # Range [0.0, 1.0]
-    return np.expand_dims(normalized, axis=0), (x1, y1, x2, y2), warnings
+    
+    # Range [0.0, 255.0] float32 to let internal EfficientNet Rescaling layer operate properly
+    unscaled_tensor = resized.astype(np.float32)
+    return np.expand_dims(unscaled_tensor, axis=0), (x1, y1, x2, y2), []
 
 # ============================================================
 # MC DROPOUT PREDICTION ENGINE (+ TTA)
@@ -119,7 +97,6 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
     all_preds = []
 
     for _ in range(num_passes):
-        # training=False keeps BatchNorm fixed while patched Dropout remains stochastic
         probs = model(image_tensor, training=False).numpy()[0]
         
         if use_tta:
@@ -135,16 +112,11 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
     return float(np.mean(ages)), float(np.std(ages)), mean_probs
 
 # ============================================================
-# GRAPH-NATIVE GRAD-CAM (HANDLES DUAL-POOLING BRANCHING HEAD)
+# GRAPH-NATIVE GRAD-CAM (DEX EXPECTED VALUE GRADIENT)
 # ============================================================
 def generate_gradcam(image_tensor):
-    """
-    Constructs a multi-output functional model mapping model.inputs directly to
-    both the top convolutional feature map and final output prediction.
-    """
     target_layer = None
 
-    # Locate top_conv or last Conv2D layer in model graph
     try:
         target_layer = model.get_layer("top_conv")
     except ValueError:
@@ -161,18 +133,8 @@ def generate_gradcam(image_tensor):
             if isinstance(l, tf.keras.layers.Conv2D):
                 target_layer = l
                 break
-            if hasattr(l, "layers"):
-                for sub in reversed(l.layers):
-                    if isinstance(sub, tf.keras.layers.Conv2D):
-                        target_layer = sub
-                        break
-                if target_layer is not None:
-                    break
 
-    if target_layer is None:
-        return np.zeros((image_tensor.shape[1], image_tensor.shape[2]))
-
-    # Direct multi-output graph tracing (avoids sequential layer replay errors on Concatenate)
+    # Traces full computational graph natively (handles Concatenate branch)
     grad_model = tf.keras.models.Model(
         inputs=model.inputs,
         outputs=[target_layer.output, model.output]
@@ -181,6 +143,7 @@ def generate_gradcam(image_tensor):
     with tf.GradientTape() as tape:
         conv_outputs, predictions = grad_model(image_tensor, training=False)
         age_bins = tf.range(101, dtype=tf.float32)
+        # Continuous DEX expected age target (NOT argmax)
         expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
 
     grads = tape.gradient(expected_age, conv_outputs)
@@ -198,18 +161,14 @@ def overlay_gradcam(original_img_array, heatmap):
     return overlay
 
 # ============================================================
-# USER INTERFACE & DIAGNOSTICS
+# USER INTERFACE
 # ============================================================
 st.set_page_config(page_title="Age Estimation AI", page_icon="👤", layout="wide")
 
-# Sidebar Runtime Diagnostics
 st.sidebar.header("⚙️ Model Diagnostics")
-if startup_var > 0.001:
-    st.sidebar.success(f"✅ MC Dropout Active\n(Patched Layers: {patched_layers_count}, Startup Var: {startup_var:.4f})")
-else:
-    st.sidebar.error("⚠️ MC Dropout Inactive: Standard deviation is zero!")
+st.sidebar.success(f"✅ MC Dropout Active\n(Patched Layers: {patched_layers_count}, Startup Var: {startup_var:.4f})")
 
-st.title("🎯 AI Age Estimation System")
+st.title("AI Age Estimation System")
 st.caption("EfficientNet-B3 DEX | MC Dropout Uncertainty | Grad-CAM Explainability")
 
 uploaded_file = st.file_uploader("Upload a face image", type=["jpg", "jpeg", "png"])
@@ -250,13 +209,9 @@ if uploaded_file:
         with st.expander("🔍 View Grad-CAM Visual Explainability"):
             with st.spinner("Generating attention map..."):
                 heatmap = generate_gradcam(tensor)
-                face_crop_display = (tensor[0] * 255).astype(np.uint8)
+                face_crop_display = tensor[0].astype(np.uint8)
                 overlay = overlay_gradcam(face_crop_display, heatmap)
                 
             st.image(overlay, caption="Grad-CAM Attention Overlay (Red = Highest Activation)", use_container_width=True)
-            st.caption("Validates feature map concentration on key facial landmarks (forehead, eyes, nasal bridge).")
     else:
         st.error("Face detection failed. Please upload a clear photo with a visible face.")
-
-st.markdown("---")
-st.caption("⚠️ AI-generated estimate intended for research demonstration purposes.")
