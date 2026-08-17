@@ -13,12 +13,12 @@ MODEL_PATH = "best_soft_label_model.keras"
 GDRIVE_FILE_ID = "1oN5aI1HHgZNga2qZ5ADDXzQBoW0bI8U-"
 
 # ============================================================
-# CACHED MODEL & DETECTOR LOADING (AUTO-DOWNLOADS FROM GDRIVE)
+# CACHED MODEL & DETECTOR LOADING
 # ============================================================
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("Downloading model weights from Google Drive..."):
+        with st.spinner("Downloading model weights..."):
             url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
             gdown.download(url, MODEL_PATH, quiet=False)
     model = tf.keras.models.load_model(MODEL_PATH, compile=False)
@@ -59,7 +59,7 @@ def check_image_quality(face_crop_array):
     return warnings
 
 # ============================================================
-# FACE DETECTION + PREPROCESSING (MTCNN + 20% PADDING)
+# FACE DETECTION + PREPROCESSING
 # ============================================================
 def crop_and_align_face(image_pil, target_size=(256, 256)):
     img_array = np.array(image_pil.convert('RGB'))
@@ -103,17 +103,60 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
     return float(np.mean(ages)), float(np.std(ages)), mean_probs
 
 # ============================================================
-# GRAD-CAM EXPLAINABILITY
+# DYNAMIC GRAD-CAM
 # ============================================================
-def generate_gradcam(image_tensor, model, last_conv_layer_name="top_conv"):
-    grad_model = tf.keras.models.Model(
-        [model.inputs],
-        [model.get_layer(last_conv_layer_name).output, model.output]
-    )
-    with tf.GradientTape() as tape:
-        conv_output, predictions = grad_model(image_tensor)
-        age_bins = tf.range(101, dtype=tf.float32)
-        expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+def generate_gradcam(image_tensor, model):
+    target_layer = None
+    target_model = model
+
+    for layer in reversed(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            target_layer = layer
+            break
+        if hasattr(layer, 'layers'):
+            for sub_layer in reversed(layer.layers):
+                if isinstance(sub_layer, tf.keras.layers.Conv2D):
+                    target_layer = sub_layer
+                    target_model = layer
+                    break
+            if target_layer is not None:
+                break
+
+    if target_layer is None:
+        for name in ["top_conv", "top_activation", "conv2d", "block7b_project_conv"]:
+            try:
+                target_layer = model.get_layer(name)
+                break
+            except ValueError:
+                continue
+
+    if target_layer is None:
+        return np.zeros((image_tensor.shape[1], image_tensor.shape[2]))
+
+    if target_model != model:
+        grad_model = tf.keras.models.Model(
+            [target_model.inputs],
+            [target_layer.output, target_model.output]
+        )
+        with tf.GradientTape() as tape:
+            conv_output, backbone_output = grad_model(image_tensor)
+            x = backbone_output
+            idx = model.layers.index(target_model)
+            for head_layer in model.layers[idx + 1:]:
+                x = head_layer(x)
+            predictions = x
+            age_bins = tf.range(101, dtype=tf.float32)
+            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+    else:
+        grad_model = tf.keras.models.Model(
+            [model.inputs],
+            [target_layer.output, model.output]
+        )
+        with tf.GradientTape() as tape:
+            conv_output, predictions = grad_model(image_tensor)
+            age_bins = tf.range(101, dtype=tf.float32)
+            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+
     grads = tape.gradient(expected_age, conv_output)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_output = conv_output[0]
@@ -128,7 +171,7 @@ def overlay_gradcam(original_img_array, heatmap):
     return overlay
 
 # ============================================================
-# STREAMLIT INTERFACE
+# STREAMLIT UI
 # ============================================================
 st.set_page_config(page_title="Age Estimation AI", page_icon="👤", layout="wide")
 st.title("🎯 AI Age Estimation System")
