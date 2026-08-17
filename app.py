@@ -113,7 +113,7 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
 # GRAPH-NATIVE GRAD-CAM (K3 & DTYPE MATCHED)
 # ============================================================
 def generate_gradcam(image_tensor):
-    # 1. Locate inner backbone submodel and the target convolutional layer
+    # 1. Locate inner backbone submodel and target layer
     backbone = None
     target_layer = None
 
@@ -132,7 +132,7 @@ def generate_gradcam(image_tensor):
                 target_layer = layer
                 break
 
-    # 2. Extract feature-maps through a sub-model
+    # 2. Extract feature maps through sub-model
     if backbone is not None:
         backbone_grad_model = tf.keras.Model(
             inputs=backbone.inputs,
@@ -155,7 +155,6 @@ def generate_gradcam(image_tensor):
             concat_out = concat_layer([gap_out, gmp_out])
             predictions = dense_layer(concat_out)
 
-            # Cast age range dynamically to match prediction tensor dtype
             num_classes = tf.shape(predictions)[-1]
             age_bins = tf.cast(tf.range(num_classes), dtype=predictions.dtype)
             expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
@@ -176,16 +175,6 @@ def generate_gradcam(image_tensor):
     heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
-
-def overlay_gradcam(original_img_array, heatmap):
-    heatmap_resized = cv2.resize(heatmap, (original_img_array.shape[1], original_img_array.shape[0]))
-    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    
-    # Fix BGR to RGB conversion for Streamlit UI compatibility
-    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
-    
-    overlay = cv2.addWeighted(original_img_array, 0.6, heatmap_colored, 0.4, 0)
-    return overlay
 
 # ============================================================
 # USER INTERFACE
@@ -232,14 +221,18 @@ if uploaded_file:
             ax.set_ylabel("Probability")
             ax.legend()
             st.pyplot(fig)
-            plt.close(fig)  # Prevents Streamlit RAM accumulation
+            plt.close(fig)
 
         with st.expander("🔍 View Grad-CAM Visual Explainability"):
             with st.spinner("Generating attention map..."):
                 heatmap = generate_gradcam(tensor)
-                face_crop_display = tensor[0].astype(np.uint8)
-                overlay = overlay_gradcam(face_crop_display, heatmap)
                 
-            st.image(overlay, caption="Grad-CAM Attention Overlay (Red = Highest Activation)", use_container_width=True)
+                fig_cam, ax_cam = plt.subplots(figsize=(5, 5))
+                im = ax_cam.imshow(heatmap, cmap='jet', interpolation='bilinear')
+                ax_cam.axis('off')
+                fig_cam.colorbar(im, ax=ax_cam, fraction=0.046, pad=0.04, label="Activation Intensity")
+                
+                st.pyplot(fig_cam)
+                plt.close(fig_cam)
     else:
         st.error("Face detection failed. Please upload a clear photo with a visible face.")
