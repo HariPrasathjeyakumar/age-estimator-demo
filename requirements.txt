@@ -1,0 +1,7 @@
+streamlit>=1.30.0
+tensorflow>=2.15.0
+mtcnn>=0.1.1
+opencv-python-headless>=4.8.0
+matplotlib>=3.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
