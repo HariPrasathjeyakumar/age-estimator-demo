@@ -176,6 +176,21 @@ def generate_gradcam(image_tensor):
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
+def create_pil_overlay(original_tensor_crop, heatmap, alpha=0.4):
+    """Blends 2D heatmap onto face crop using PIL/Matplotlib (Zero OpenCV)."""
+    base_img = np.clip(original_tensor_crop[0], 0, 255).astype(np.uint8)
+    
+    heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
+    heatmap_resized = heatmap_pil.resize((base_img.shape[1], base_img.shape[0]), resample=Image.BILINEAR)
+    heatmap_resized_np = np.array(heatmap_resized) / 255.0
+
+    colormap = plt.get_cmap('jet')
+    heatmap_colored = colormap(heatmap_resized_np)[:, :, :3]
+    heatmap_colored_uint8 = (heatmap_colored * 255).astype(np.uint8)
+
+    blended = (1.0 - alpha) * base_img.astype(np.float32) + alpha * heatmap_colored_uint8.astype(np.float32)
+    return np.clip(blended, 0, 255).astype(np.uint8)
+
 # ============================================================
 # USER INTERFACE
 # ============================================================
@@ -226,13 +241,12 @@ if uploaded_file:
         with st.expander("🔍 View Grad-CAM Visual Explainability"):
             with st.spinner("Generating attention map..."):
                 heatmap = generate_gradcam(tensor)
+                overlay_img = create_pil_overlay(tensor, heatmap, alpha=0.4)
                 
-                fig_cam, ax_cam = plt.subplots(figsize=(5, 5))
-                im = ax_cam.imshow(heatmap, cmap='jet', interpolation='bilinear')
-                ax_cam.axis('off')
-                fig_cam.colorbar(im, ax=ax_cam, fraction=0.046, pad=0.04, label="Activation Intensity")
-                
-                st.pyplot(fig_cam)
-                plt.close(fig_cam)
+            st.image(
+                overlay_img, 
+                caption="Grad-CAM Attention Overlay (Red = Highest Model Focus)", 
+                use_container_width=True
+            )
     else:
         st.error("Face detection failed. Please upload a clear photo with a visible face.")
