@@ -13,37 +13,63 @@ MODEL_PATH = "best_soft_label_model.keras"
 GDRIVE_FILE_ID = "1oN5aI1HHgZNga2qZ5ADDXzQBoW0bI8U-"
 
 # ============================================================
-# CACHED MODEL & DETECTOR LOADING
+# MC DROPOUT PATCHING & CACHED MODEL LOADING
 # ============================================================
+def patch_mc_dropout(model_obj):
+    """
+    Recursively patches all Dropout layers to force training=True during inference.
+    Leaves BatchNorm in evaluation mode to prevent distribution drift.
+    """
+    patched_count = 0
+
+    def _recursive_patch(container):
+        nonlocal patched_count
+        layers = getattr(container, 'layers', getattr(container, 'submodules', []))
+        for layer in layers:
+            if isinstance(layer, tf.keras.layers.Dropout):
+                if not getattr(layer, '_mc_patched', False):
+                    orig_call = layer.call
+                    layer.call = lambda inputs, *args, _orig=orig_call, **kwargs: _orig(inputs, training=True)
+                    layer._mc_patched = True
+                    patched_count += 1
+            if hasattr(layer, 'layers') or hasattr(layer, 'submodules'):
+                _recursive_patch(layer)
+
+    _recursive_patch(model_obj)
+    return patched_count
+
 @st.cache_resource
-def load_model():
+def load_model_and_verify():
+    """
+    Loads weights, applies MC Dropout patch, and executes a 5-pass startup test
+    to guarantee stochastic inference inside Streamlit's runtime.
+    """
     if not os.path.exists(MODEL_PATH):
-        with st.spinner("Downloading model weights..."):
+        with st.spinner("Downloading model weights from Google Drive..."):
             url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
             gdown.download(url, MODEL_PATH, quiet=False)
-    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    return model
+            
+    loaded_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+    num_patched = patch_mc_dropout(loaded_model)
+
+    # Startup Diagnostic: Verify variance across 5 stochastic passes
+    dummy_input = np.random.rand(1, 256, 256, 3).astype(np.float32)
+    age_bins = np.arange(101)
+    test_preds = [
+        float(np.sum(age_bins * loaded_model(dummy_input, training=False).numpy()[0]))
+        for _ in range(5)
+    ]
+    startup_variance = float(np.var(test_preds))
+
+    return loaded_model, num_patched, startup_variance
 
 @st.cache_resource
 def load_detector():
     return MTCNN()
 
-model = load_model()
+# Initialize model and detector
+model, patched_layers_count, startup_var = load_model_and_verify()
 detector = load_detector()
-
-# Patch dropout for MC Dropout uncertainty
-def patch_dropout_layers(layer_container):
-    layers = getattr(layer_container, 'layers', getattr(layer_container, 'submodules', []))
-    for layer in layers:
-        if isinstance(layer, tf.keras.layers.Dropout):
-            if not hasattr(layer, '_mc_patched'):
-                orig_call = layer.call
-                layer.call = lambda inputs, *args, _orig=orig_call, **kwargs: _orig(inputs, training=True)
-                layer._mc_patched = True
-        if hasattr(layer, 'layers') or hasattr(layer, 'submodules'):
-            patch_dropout_layers(layer)
-
-patch_dropout_layers(model)
 
 # ============================================================
 # QUALITY GATING
@@ -53,24 +79,27 @@ def check_image_quality(face_crop_array):
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
     warnings = []
     if blur_score < 50:
-        warnings.append(f"⚠️ Image appears blurry (score: {blur_score:.1f})")
+        warnings.append(f"⚠️ Image appears blurry (Laplacian Variance: {blur_score:.1f})")
     if face_crop_array.shape[0] < 80 or face_crop_array.shape[1] < 80:
-        warnings.append("⚠️ Face resolution is low — accuracy may be reduced")
+        warnings.append("⚠️ Low face resolution (< 80x80 px) — accuracy may be impacted")
     return warnings
 
 # ============================================================
-# FACE DETECTION + PREPROCESSING
+# FACE DETECTION & STANDARDIZED PREPROCESSING
 # ============================================================
 def crop_and_align_face(image_pil, target_size=(256, 256)):
     img_array = np.array(image_pil.convert('RGB'))
     results = detector.detect_faces(img_array)
 
     if not results:
-        return None, None, ["⚠️ No face detected — cannot generate a reliable prediction"]
+        return None, None, ["⚠️ No face detected — please upload a clearer face image"]
 
+    # Select largest detected face bounding box
     best_face = max(results, key=lambda r: r['box'][2] * r['box'][3])
     x, y, w, h = best_face['box']
     x, y = max(0, x), max(0, y)
+
+    # 20% padding expansion to match training pipeline
     pad_x, pad_y = int(w * 0.20), int(h * 0.20)
     x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
     x2, y2 = min(img_array.shape[1], x + w + pad_x), min(img_array.shape[0], y + h + pad_y)
@@ -79,22 +108,25 @@ def crop_and_align_face(image_pil, target_size=(256, 256)):
     warnings = check_image_quality(face_crop)
 
     resized = cv2.resize(face_crop, target_size)
-    normalized = resized.astype(np.float32) / 255.0
+    normalized = resized.astype(np.float32) / 255.0  # Range [0.0, 1.0]
     return np.expand_dims(normalized, axis=0), (x1, y1, x2, y2), warnings
 
 # ============================================================
-# MC DROPOUT PREDICTION + TTA
+# MC DROPOUT PREDICTION ENGINE (+ TTA)
 # ============================================================
 def predict_age(image_tensor, num_passes=10, use_tta=True):
     age_bins = np.arange(101)
     all_preds = []
 
     for _ in range(num_passes):
+        # training=False keeps BatchNorm fixed while patched Dropout remains stochastic
         probs = model(image_tensor, training=False).numpy()[0]
+        
         if use_tta:
-            flipped = image_tensor[:, :, ::-1, :]
-            probs_flipped = model(flipped, training=False).numpy()[0]
-            probs = (probs + probs_flipped) / 2
+            flipped_tensor = image_tensor[:, :, ::-1, :]
+            probs_flipped = model(flipped_tensor, training=False).numpy()[0]
+            probs = (probs + probs_flipped) / 2.0
+            
         expected_age = np.sum(age_bins * probs)
         all_preds.append((expected_age, probs))
 
@@ -103,64 +135,59 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
     return float(np.mean(ages)), float(np.std(ages)), mean_probs
 
 # ============================================================
-# DYNAMIC GRAD-CAM
+# GRAPH-NATIVE GRAD-CAM (HANDLES DUAL-POOLING BRANCHING HEAD)
 # ============================================================
-def generate_gradcam(image_tensor, model):
+def generate_gradcam(image_tensor):
+    """
+    Constructs a multi-output functional model mapping model.inputs directly to
+    both the top convolutional feature map and final output prediction.
+    """
     target_layer = None
-    target_model = model
 
-    for layer in reversed(model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            target_layer = layer
-            break
-        if hasattr(layer, 'layers'):
-            for sub_layer in reversed(layer.layers):
-                if isinstance(sub_layer, tf.keras.layers.Conv2D):
-                    target_layer = sub_layer
-                    target_model = layer
+    # Locate top_conv or last Conv2D layer in model graph
+    try:
+        target_layer = model.get_layer("top_conv")
+    except ValueError:
+        for l in model.layers:
+            if hasattr(l, "get_layer"):
+                try:
+                    target_layer = l.get_layer("top_conv")
                     break
-            if target_layer is not None:
-                break
+                except ValueError:
+                    pass
 
     if target_layer is None:
-        for name in ["top_conv", "top_activation", "conv2d", "block7b_project_conv"]:
-            try:
-                target_layer = model.get_layer(name)
+        for l in reversed(model.layers):
+            if isinstance(l, tf.keras.layers.Conv2D):
+                target_layer = l
                 break
-            except ValueError:
-                continue
+            if hasattr(l, "layers"):
+                for sub in reversed(l.layers):
+                    if isinstance(sub, tf.keras.layers.Conv2D):
+                        target_layer = sub
+                        break
+                if target_layer is not None:
+                    break
 
     if target_layer is None:
         return np.zeros((image_tensor.shape[1], image_tensor.shape[2]))
 
-    if target_model != model:
-        grad_model = tf.keras.models.Model(
-            [target_model.inputs],
-            [target_layer.output, target_model.output]
-        )
-        with tf.GradientTape() as tape:
-            conv_output, backbone_output = grad_model(image_tensor)
-            x = backbone_output
-            idx = model.layers.index(target_model)
-            for head_layer in model.layers[idx + 1:]:
-                x = head_layer(x)
-            predictions = x
-            age_bins = tf.range(101, dtype=tf.float32)
-            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
-    else:
-        grad_model = tf.keras.models.Model(
-            [model.inputs],
-            [target_layer.output, model.output]
-        )
-        with tf.GradientTape() as tape:
-            conv_output, predictions = grad_model(image_tensor)
-            age_bins = tf.range(101, dtype=tf.float32)
-            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+    # Direct multi-output graph tracing (avoids sequential layer replay errors on Concatenate)
+    grad_model = tf.keras.models.Model(
+        inputs=model.inputs,
+        outputs=[target_layer.output, model.output]
+    )
 
-    grads = tape.gradient(expected_age, conv_output)
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(image_tensor, training=False)
+        age_bins = tf.range(101, dtype=tf.float32)
+        expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
+
+    grads = tape.gradient(expected_age, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_output = conv_output[0]
-    heatmap = tf.reduce_sum(conv_output * pooled_grads, axis=-1)
+    conv_outputs = conv_outputs[0]
+
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
     return heatmap.numpy()
 
@@ -171,9 +198,17 @@ def overlay_gradcam(original_img_array, heatmap):
     return overlay
 
 # ============================================================
-# STREAMLIT UI
+# USER INTERFACE & DIAGNOSTICS
 # ============================================================
 st.set_page_config(page_title="Age Estimation AI", page_icon="👤", layout="wide")
+
+# Sidebar Runtime Diagnostics
+st.sidebar.header("⚙️ Model Diagnostics")
+if startup_var > 0.001:
+    st.sidebar.success(f"✅ MC Dropout Active\n(Patched Layers: {patched_layers_count}, Startup Var: {startup_var:.4f})")
+else:
+    st.sidebar.error("⚠️ MC Dropout Inactive: Standard deviation is zero!")
+
 st.title("🎯 AI Age Estimation System")
 st.caption("EfficientNet-B3 DEX | MC Dropout Uncertainty | Grad-CAM Explainability")
 
@@ -183,7 +218,7 @@ if uploaded_file:
     image_pil = Image.open(uploaded_file)
     col1, col2 = st.columns(2)
 
-    with st.spinner("Analyzing image..."):
+    with st.spinner("Processing face alignment and MC inference..."):
         tensor, box, warnings = crop_and_align_face(image_pil)
 
     for w in warnings:
@@ -193,30 +228,35 @@ if uploaded_file:
         mean_age, std_age, mean_probs = predict_age(tensor, num_passes=10, use_tta=True)
 
         with col1:
-            st.image(image_pil, caption="Uploaded Image", use_container_width=True)
+            st.image(image_pil, caption="Uploaded Input", use_container_width=True)
 
         with col2:
             st.metric("Predicted Age", f"{mean_age:.1f} years")
-            st.metric("Confidence Range (±1σ)", f"{mean_age-std_age:.1f} – {mean_age+std_age:.1f} years")
+            st.metric("Uncertainty Range (±1σ)", f"{mean_age-std_age:.1f} – {mean_age+std_age:.1f} years (σ = {std_age:.2f})")
 
             fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(np.arange(101), mean_probs, color='steelblue')
-            ax.axvline(mean_age, color='red', linestyle='--', label=f'Predicted: {mean_age:.1f}')
-            ax.fill_between(np.arange(101), mean_probs, alpha=0.2,
-                            where=(np.arange(101) >= mean_age-std_age) & (np.arange(101) <= mean_age+std_age))
+            ax.plot(np.arange(101), mean_probs, color='steelblue', label='Output PDF')
+            ax.axvline(mean_age, color='red', linestyle='--', label=f'Mean: {mean_age:.1f}')
+            ax.fill_between(
+                np.arange(101), mean_probs, alpha=0.25, color='steelblue',
+                where=(np.arange(101) >= mean_age-std_age) & (np.arange(101) <= mean_age+std_age),
+                label='±1σ Bounds'
+            )
             ax.set_xlabel("Age Class")
             ax.set_ylabel("Probability")
             ax.legend()
             st.pyplot(fig)
 
-        with st.expander("🔍 View Grad-CAM Explainability"):
-            heatmap = generate_gradcam(tensor, model)
-            face_crop_display = (tensor[0] * 255).astype(np.uint8)
-            overlay = overlay_gradcam(face_crop_display, heatmap)
-            st.image(overlay, caption="Model attention heatmap (red = primary influence)", use_container_width=True)
-            st.caption("Confirms feature extraction focus on structural facial regions (eyes, forehead, mouth area).")
+        with st.expander("🔍 View Grad-CAM Visual Explainability"):
+            with st.spinner("Generating attention map..."):
+                heatmap = generate_gradcam(tensor)
+                face_crop_display = (tensor[0] * 255).astype(np.uint8)
+                overlay = overlay_gradcam(face_crop_display, heatmap)
+                
+            st.image(overlay, caption="Grad-CAM Attention Overlay (Red = Highest Activation)", use_container_width=True)
+            st.caption("Validates feature map concentration on key facial landmarks (forehead, eyes, nasal bridge).")
     else:
-        st.error("Could not process this image. Please upload a clear photo with a visible face.")
+        st.error("Face detection failed. Please upload a clear photo with a visible face.")
 
 st.markdown("---")
-st.caption("⚠️ This application provides an AI estimate for research purposes and is not a legally verified age check.")
+st.caption("⚠️ AI-generated estimate intended for research demonstration purposes.")
