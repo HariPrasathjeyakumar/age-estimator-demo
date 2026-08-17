@@ -115,44 +115,58 @@ def predict_age(image_tensor, num_passes=10, use_tta=True):
 # GRAPH-NATIVE GRAD-CAM (DEX EXPECTED VALUE GRADIENT)
 # ============================================================
 def generate_gradcam(image_tensor):
-    # 1. Locate the target convolutional layer name
-    target_layer_name = "top_conv"
-    target_layer_exists = any(
-        l.name == target_layer_name or (hasattr(l, "layers") and any(sub.name == target_layer_name for sub in l.layers))
-        for l in model.layers
-    )
-    if not target_layer_exists:
-        # Fallback to the last Conv2D layer in the model
-        for l in reversed(model.layers):
-            if isinstance(l, tf.keras.layers.Conv2D):
-                target_layer_name = l.name
+    # 1. Recursively find the target convolutional layer (top_conv or last Conv2D)
+    target_layer = None
+    
+    for layer in model.layers:
+        if layer.name == "top_conv":
+            target_layer = layer
+            break
+        if hasattr(layer, "layers"):
+            for sub in layer.layers:
+                if sub.name == "top_conv":
+                    target_layer = sub
+                    break
+            if target_layer:
                 break
 
-    # 2. Run sequential forward pass inside GradientTape without creating a sub-model
+    # Fallback to the last Conv2D layer if 'top_conv' isn't explicitly named
+    if target_layer is None:
+        for layer in reversed(model.layers):
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                target_layer = layer
+                break
+            if hasattr(layer, "layers"):
+                for sub in reversed(layer.layers):
+                    if isinstance(sub, tf.keras.layers.Conv2D):
+                        target_layer = sub
+                        break
+                if target_layer:
+                    break
+
+    # 2. Construct multi-output Keras model using original functional graph
+    grad_model = tf.keras.Model(
+        inputs=model.inputs,
+        outputs=[target_layer.output, model.output]
+    )
+
+    # 3. Forward pass & gradient computation w.r.t continuous DEX expected age
     with tf.GradientTape() as tape:
-        x = image_tensor
-        conv_outputs = None
-
-        for layer in model.layers:
-            x = layer(x, training=False)
-            if layer.name == target_layer_name:
-                conv_outputs = x
-                tape.watch(conv_outputs)
-
-        predictions = x
+        conv_outputs, predictions = grad_model(image_tensor, training=False)
         age_bins = tf.range(101, dtype=tf.float32)
-        # DEX expected age target (continuous expected value, NOT argmax)
+        # Continuous DEX expected age target (NOT argmax)
         expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
 
-    # 3. Compute gradients of expected age w.r.t target layer activations
+    # 4. Extract pooled gradients and construct activation heatmap
     grads = tape.gradient(expected_age, conv_outputs)
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
 
-    # 4. Generate normalized heatmap
     heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
     heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    
     return heatmap.numpy()
+    
 def overlay_gradcam(original_img_array, heatmap):
     heatmap_resized = cv2.resize(heatmap, (original_img_array.shape[1], original_img_array.shape[0]))
     heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
