@@ -36,7 +36,14 @@ st.set_page_config(
 # matter how deeply the call is nested in your Python code.
 
 def render_html(html: str):
-    st.markdown(textwrap.dedent(html).strip(), unsafe_allow_html=True)
+    # Strip leading whitespace from EVERY line individually (not just
+    # the common prefix like textwrap.dedent does). Nested HTML often
+    # has an outer tag at column 0 with inner tags indented for
+    # readability - dedent leaves those inner lines indented, which
+    # still triggers Markdown's 4-space code-block rule. Per-line
+    # lstrip() removes the trigger no matter how the HTML is nested.
+    lines = [line.lstrip() for line in html.strip("\n").split("\n")]
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
 
 
 # ============================================================
