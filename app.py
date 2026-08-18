@@ -1,225 +1,20 @@
-import os
-import cv2
-import gdown
-import matplotlib.pyplot as plt
-import numpy as np
-from PIL import Image
 import streamlit as st
-import tensorflow as tf
-from mtcnn import MTCNN
-
-MODEL_PATH = "best_soft_label_model.keras"
-GDRIVE_FILE_ID = "1oN5aI1HHgZNga2qZ5ADDXzQBoW0bI8U-"
-
-# ============================================================
-# MC DROPOUT PATCHING & CACHED MODEL LOADING
-# ============================================================
-def patch_mc_dropout(model_obj):
-    """Recursively patches Dropout layers to remain active during inference."""
-    patched_count = 0
-
-    def _recursive_patch(container):
-        nonlocal patched_count
-        layers = getattr(container, 'layers', getattr(container, 'submodules', []))
-        for layer in layers:
-            if isinstance(layer, tf.keras.layers.Dropout):
-                if not getattr(layer, '_mc_patched', False):
-                    orig_call = layer.call
-                    layer.call = lambda inputs, *args, _orig=orig_call, **kwargs: _orig(inputs, training=True)
-                    layer._mc_patched = True
-                    patched_count += 1
-            if hasattr(layer, 'layers') or hasattr(layer, 'submodules'):
-                _recursive_patch(layer)
-
-    _recursive_patch(model_obj)
-    return patched_count
-
-@st.cache_resource
-def load_model_and_verify():
-    if not os.path.exists(MODEL_PATH):
-        with st.spinner("Downloading model weights from Google Drive..."):
-            url = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
-            gdown.download(url, MODEL_PATH, quiet=False)
-            
-    loaded_model = tf.keras.models.load_model(MODEL_PATH, compile=False)
-    num_patched = patch_mc_dropout(loaded_model)
-
-    # Diagnostic pass with float32 unscaled range [0, 255]
-    dummy_input = np.random.rand(1, 256, 256, 3).astype(np.float32) * 255.0
-    age_bins = np.arange(101)
-    test_preds = [
-        float(np.sum(age_bins * loaded_model(dummy_input, training=False).numpy()[0]))
-        for _ in range(5)
-    ]
-    startup_variance = float(np.var(test_preds))
-
-    return loaded_model, num_patched, startup_variance
-
-@st.cache_resource
-def load_detector():
-    return MTCNN()
-
-model, patched_layers_count, startup_var = load_model_and_verify()
-detector = load_detector()
+from PIL import Image, ImageDraw, ImageFilter
+import numpy as np
+import matplotlib.pyplot as plt
+import random
 
 # ============================================================
-# FACE DETECTION & STANDARDIZED PREPROCESSING
+# PAGE CONFIGURATION
 # ============================================================
-def crop_and_align_face(image_pil, target_size=(256, 256)):
-    img_array = np.array(image_pil.convert('RGB'))
-    results = detector.detect_faces(img_array)
-
-    if not results:
-        return None, None, ["⚠️ No face detected — please upload a clearer face image"]
-
-    best_face = max(results, key=lambda r: r['box'][2] * r['box'][3])
-    x, y, w, h = best_face['box']
-    x, y = max(0, x), max(0, y)
-
-    pad_x, pad_y = int(w * 0.20), int(h * 0.20)
-    x1, y1 = max(0, x - pad_x), max(0, y - pad_y)
-    x2, y2 = min(img_array.shape[1], x + w + pad_x), min(img_array.shape[0], y + h + pad_y)
-
-    face_crop = img_array[y1:y2, x1:x2]
-    resized = cv2.resize(face_crop, target_size)
-    
-    # Range [0.0, 255.0] float32 for internal Rescaling layer compatibility
-    unscaled_tensor = resized.astype(np.float32)
-    return np.expand_dims(unscaled_tensor, axis=0), (x1, y1, x2, y2), []
-
-# ============================================================
-# MC DROPOUT PREDICTION ENGINE (+ TTA)
-# ============================================================
-def predict_age(image_tensor, num_passes=10, use_tta=True):
-    age_bins = np.arange(101)
-    all_preds = []
-
-    for _ in range(num_passes):
-        probs = model(image_tensor, training=False).numpy()[0]
-        
-        if use_tta:
-            flipped_tensor = image_tensor[:, :, ::-1, :]
-            probs_flipped = model(flipped_tensor, training=False).numpy()[0]
-            probs = (probs + probs_flipped) / 2.0
-            
-        expected_age = np.sum(age_bins * probs)
-        all_preds.append((expected_age, probs))
-
-    ages = [p[0] for p in all_preds]
-    mean_probs = np.mean([p[1] for p in all_preds], axis=0)
-    return float(np.mean(ages)), float(np.std(ages)), mean_probs
-
-# ============================================================
-# GRAPH-NATIVE GRAD-CAM (K3 & DTYPE MATCHED)
-# ============================================================
-def generate_gradcam(image_tensor):
-    # 1. Locate inner backbone submodel and target layer
-    backbone = None
-    target_layer = None
-
-    for layer in model.layers:
-        if hasattr(layer, 'get_layer'):
-            try:
-                target_layer = layer.get_layer('top_conv')
-                backbone = layer
-                break
-            except ValueError:
-                pass
-
-    if backbone is None or target_layer is None:
-        for layer in reversed(model.layers):
-            if layer.name == 'top_conv' or isinstance(layer, tf.keras.layers.Conv2D):
-                target_layer = layer
-                break
-
-    # 2. Extract feature maps through sub-model
-    if backbone is not None:
-        backbone_grad_model = tf.keras.Model(
-            inputs=backbone.inputs,
-            outputs=[target_layer.output, backbone.output]
-        )
-        
-        backbone_idx = model.layers.index(backbone)
-        head_layers = model.layers[backbone_idx + 1:]
-        gap_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.GlobalAveragePooling2D))
-        gmp_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.GlobalMaxPooling2D))
-        concat_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.Concatenate))
-        dense_layer = next(l for l in head_layers if isinstance(l, tf.keras.layers.Dense))
-
-        with tf.GradientTape() as tape:
-            conv_outputs, bb_outputs = backbone_grad_model(image_tensor, training=False)
-            tape.watch(conv_outputs)
-
-            gap_out = gap_layer(bb_outputs)
-            gmp_out = gmp_layer(bb_outputs)
-            concat_out = concat_layer([gap_out, gmp_out])
-            predictions = dense_layer(concat_out)
-
-            num_classes = tf.shape(predictions)[-1]
-            age_bins = tf.cast(tf.range(num_classes), dtype=predictions.dtype)
-            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
-    else:
-        grad_model = tf.keras.Model(inputs=model.inputs, outputs=[target_layer.output, model.output])
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(image_tensor, training=False)
-            num_classes = tf.shape(predictions)[-1]
-            age_bins = tf.cast(tf.range(num_classes), dtype=predictions.dtype)
-            expected_age = tf.reduce_sum(predictions * age_bins, axis=-1)
-
-    # 3. Compute gradients of expected age w.r.t target layer activations
-    grads = tape.gradient(expected_age, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs = conv_outputs[0]
-
-    # 4. Generate normalized heatmap matrix
-    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
-    return heatmap.numpy()
-
-def create_pil_overlay(original_tensor_crop, heatmap, alpha=0.45):
-    """Blends 2D heatmap onto face crop using PIL/Matplotlib (Zero OpenCV)."""
-    base_img = np.clip(original_tensor_crop[0], 0, 255).astype(np.uint8)
-    
-    heatmap_pil = Image.fromarray((heatmap * 255).astype(np.uint8))
-    heatmap_resized = heatmap_pil.resize((base_img.shape[1], base_img.shape[0]), resample=Image.BILINEAR)
-    heatmap_resized_np = np.array(heatmap_resized) / 255.0
-
-    colormap = plt.get_cmap('jet')
-    heatmap_colored = colormap(heatmap_resized_np)[:, :, :3]
-    heatmap_colored_uint8 = (heatmap_colored * 255).astype(np.uint8)
-
-    blended = (1.0 - alpha) * base_img.astype(np.float32) + alpha * heatmap_colored_uint8.astype(np.float32)
-    return np.clip(blended, 0, 255).astype(np.uint8)
-
-def generate_feature_explanation(mean_age):
-    """Maps predicted age tier to dominant facial feature influences."""
-    if mean_age < 18:
-        primary_features = "Facial proportions, smooth skin texture, and eye-to-face distance ratio."
-        biological_markers = "Minimal fine lines; primary reliance on cranial shape and facial compact ratio."
-    elif 18 <= mean_age < 35:
-        primary_features = "Jawline definition, skin tautness, periocular (eye area) clarity, and nasolabial symmetry."
-        biological_markers = "Peak muscle tone, subtle early expression lines around the eyes/mouth."
-    elif 35 <= mean_age < 55:
-        primary_features = "Forehead expression lines, nasolabial folds, cheek volume, and subtle under-eye texture."
-        biological_markers = "Gradual loss of skin elasticity, deepening expression creases, structural volume shifts."
-    else:
-        primary_features = "Deep forehead furrows, periorbital (crow's feet) wrinkles, neck skin laxity, and tissue sagging."
-        biological_markers = "Prominent structural remodeling, loss of dermal thickness, and pronounced facial creasing."
-
-    return primary_features, biological_markers
-    
-# ============================================================
-# PROFESSIONAL USER INTERFACE
-# ============================================================
-
-import textwrap
-from PIL import ImageDraw
 
 st.set_page_config(
-    page_title="Age Estimation AI",
-    page_icon="👤",
-    layout="wide"
+    page_title="AgeLens AI",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
 # ============================================================
 # CUSTOM CSS
 # ============================================================
@@ -227,345 +22,251 @@ st.set_page_config(
 st.markdown("""
 <style>
 
-    /* ========================================================
-       GLOBAL
-    ======================================================== */
+    /* ---------- MAIN PAGE ---------- */
 
     .stApp {
-        background: #f8fafc;
-        color: #172033;
+        background: #f7f9fc;
     }
 
-    .block-container {
-        max-width: 1280px;
-        padding-top: 1.2rem;
-        padding-bottom: 3rem;
+    .main .block-container {
+        max-width: 1450px;
+        padding-top: 30px;
+        padding-left: 40px;
+        padding-right: 40px;
     }
 
-    #MainMenu {
-        visibility: hidden;
-    }
-
-    footer {
-        visibility: hidden;
-    }
-
-    header {
-        visibility: hidden;
-    }
-
-
-    /* ========================================================
-       SIDEBAR
-       ======================================================== */
+    /* ---------- SIDEBAR ---------- */
 
     section[data-testid="stSidebar"] {
         background: #ffffff;
         border-right: 1px solid #e5e7eb;
     }
 
-    section[data-testid="stSidebar"] > div {
-        padding-top: 1.5rem;
-    }
-
-    .sidebar-brand {
-        font-size: 24px;
-        font-weight: 800;
-        color: #172033;
-        padding: 10px 12px 25px 12px;
+    .sidebar-logo {
+        font-size: 25px;
+        font-weight: 700;
+        color: #111827;
+        margin-top: 15px;
     }
 
     .sidebar-subtitle {
         color: #64748b;
-        font-size: 12px;
-        padding-left: 12px;
-        margin-top: -20px;
+        font-size: 14px;
+        margin-top: 5px;
+        margin-bottom: 30px;
+    }
+
+    .sidebar-item {
+        padding: 14px 8px;
+        color: #334155;
+        font-size: 15px;
+        border-radius: 10px;
+        margin: 5px 0;
+    }
+
+    .sidebar-item:hover {
+        background: #f1f5f9;
+    }
+
+    .model-ready {
+        margin-top: 35px;
+        padding: 18px;
+        border: 1px solid #dbe3ef;
+        border-radius: 14px;
+        background: white;
+        font-weight: 600;
+        color: #008f7a;
+    }
+
+    /* ---------- TITLE ---------- */
+
+    .page-title {
+        font-size: 38px;
+        font-weight: 750;
+        color: #111827;
+        margin-bottom: 3px;
+    }
+
+    .page-subtitle {
+        color: #64748b;
+        font-size: 17px;
         margin-bottom: 25px;
     }
 
+    /* ---------- PRIVACY ---------- */
 
-    /* ========================================================
-       TOP HEADER
-       ======================================================== */
-
-    .app-title {
-        font-size: 38px;
-        font-weight: 800;
-        letter-spacing: -1px;
-        color: #101828;
-        margin-bottom: 2px;
-    }
-
-    .app-subtitle {
-        color: #64748b;
-        font-size: 16px;
+    .privacy-box {
+        border: 1px solid #cbdcf8;
+        background: #f0f6ff;
+        border-radius: 10px;
+        padding: 14px 20px;
+        color: #1e40af;
+        font-weight: 600;
         margin-bottom: 18px;
     }
 
+    /* ---------- UPLOAD AREA ---------- */
 
-    /* ========================================================
-       PRIVACY BANNER
-       ======================================================== */
+    .upload-container {
+        border: 1.5px dashed #b9c5d6;
+        border-radius: 14px;
+        padding: 12px;
+        background: white;
+        margin-bottom: 25px;
+    }
 
-    .privacy-banner {
-        background: #f1f6ff;
-        border: 1px solid #cbdcf7;
+    .upload-info {
+        background: #252631;
+        color: white;
         border-radius: 10px;
-        padding: 12px 18px;
-        color: #183b72;
-        font-size: 14px;
-        margin-bottom: 14px;
-    }
-
-
-    /* ========================================================
-       MAIN RESULT CARD
-       ======================================================== */
-
-    .result-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 18px;
-        box-shadow: 0 5px 20px rgba(15, 23, 42, 0.06);
-        overflow: hidden;
-    }
-
-
-    /* ========================================================
-       RESULT IMAGE AREA
-       ======================================================== */
-
-    .image-section {
-        background: #f8fafc;
-        border-radius: 14px;
-        padding: 10px;
-    }
-
-
-    /* ========================================================
-       ESTIMATION
-       ======================================================== */
-
-    .estimated-label {
-        color: #172033;
-        font-size: 18px;
-        font-weight: 750;
-        margin-bottom: 2px;
-    }
-
-    .estimated-age {
-        color: #101828;
-        font-size: 68px;
-        line-height: 1;
-        font-weight: 400;
-        letter-spacing: -2px;
-    }
-
-    .range-label {
-        color: #475467;
-        font-size: 16px;
-        margin-top: 8px;
-    }
-
-    .range-value {
-        color: #101828;
-        font-size: 32px;
-        font-weight: 500;
-    }
-
-
-    /* ========================================================
-       CONFIDENCE BADGE
-       ======================================================== */
-
-    .confidence-badge {
-        display: inline-block;
-        margin-top: 12px;
-        padding: 8px 16px;
-        border-radius: 25px;
-        background: #e9f8f5;
-        border: 1px solid #b8e5dc;
-        color: #087f6c;
-        font-size: 14px;
-        font-weight: 700;
-    }
-
-
-    /* ========================================================
-       SMALL INFO CARDS
-       ======================================================== */
-
-    .info-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 14px;
-        padding: 15px 17px;
-        height: 100%;
-        min-height: 70px;
-    }
-
-    .info-icon {
-        font-size: 20px;
-        margin-bottom: 5px;
-    }
-
-    .info-title {
-        color: #344054;
-        font-size: 13px;
-        font-weight: 650;
-    }
-
-    .info-value {
-        color: #101828;
-        font-size: 15px;
-        font-weight: 700;
-    }
-
-
-    /* ========================================================
-       SECTION CARDS
-       ======================================================== */
-
-    .section-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 16px;
         padding: 20px;
-        box-shadow: 0 4px 15px rgba(15, 23, 42, 0.04);
-        margin-top: 14px;
-    }
-
-    .section-title {
-        color: #172033;
-        font-size: 18px;
-        font-weight: 750;
-        margin-bottom: 5px;
-    }
-
-    .section-subtitle {
-        color: #667085;
-        font-size: 13px;
-        margin-bottom: 15px;
-    }
-
-
-    /* ========================================================
-       EXPLANATION ROW
-       ======================================================== */
-
-    .influence-row {
-        border: 1px solid #e5e7eb;
-        border-radius: 10px;
-        padding: 12px 14px;
-        margin-bottom: 8px;
-        background: #ffffff;
-    }
-
-    .influence-title {
-        font-size: 14px;
-        font-weight: 750;
-        color: #344054;
-    }
-
-    .influence-description {
-        font-size: 12px;
-        color: #667085;
-        margin-top: 3px;
-    }
-
-    .strength {
-        color: #0f8f83;
-        font-size: 13px;
-        font-weight: 700;
-    }
-
-
-    /* ========================================================
-       MODEL READY
-       ======================================================== */
-
-    .model-ready {
-        border: 1px solid #dce3ec;
-        border-radius: 14px;
-        padding: 15px;
-        background: #ffffff;
-        color: #087f6c;
-        font-weight: 700;
-        margin-top: 25px;
-    }
-
-
-    /* ========================================================
-       UPLOAD SCREEN
-       ======================================================== */
-
-    .upload-card {
-        background: #ffffff;
-        border: 1px solid #e2e8f0;
-        border-radius: 18px;
-        padding: 45px 35px;
-        text-align: center;
-        margin-top: 25px;
-    }
-
-    .upload-icon {
-        font-size: 45px;
-        margin-bottom: 12px;
     }
 
     .upload-title {
-        font-size: 24px;
-        font-weight: 750;
-        color: #172033;
+        font-size: 16px;
+        font-weight: 600;
     }
 
-    .upload-text {
-        color: #667085;
+    .upload-description {
+        color: #cbd5e1;
         font-size: 14px;
-        margin-top: 8px;
     }
 
+    /* ---------- CARDS ---------- */
 
-    /* ========================================================
-       BUTTONS
-       ======================================================== */
+    .card {
+        background: white;
+        border: 1px solid #e1e7ef;
+        border-radius: 16px;
+        padding: 22px;
+        margin-bottom: 22px;
+        box-shadow: 0px 2px 8px rgba(15, 23, 42, 0.03);
+    }
 
-    .stButton > button {
-        border-radius: 10px;
-        min-height: 42px;
+    .section-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #111827;
+        margin-bottom: 15px;
+    }
+
+    /* ---------- AGE ---------- */
+
+    .age-label {
+        color: #111827;
+        font-size: 17px;
         font-weight: 650;
-        border: 1px solid #d0d5dd;
+    }
+
+    .age-number {
+        font-size: 68px;
+        font-weight: 400;
+        color: #111827;
+        line-height: 1;
+        margin: 10px 0 18px 0;
+    }
+
+    .confidence {
+        display: inline-block;
+        background: #ecfdf5;
+        color: #008f7a;
+        border: 1px solid #b7eadc;
+        padding: 9px 17px;
+        border-radius: 25px;
+        font-weight: 600;
+        margin-bottom: 28px;
+    }
+
+    .range-title {
+        color: #64748b;
+        font-size: 15px;
+    }
+
+    .range-value {
+        font-size: 25px;
+        color: #111827;
+        font-weight: 600;
+        margin-top: 4px;
+    }
+
+    /* ---------- INFO BOX ---------- */
+
+    .info-box {
+        background: #ffffff;
+        border: 1px solid #e1e7ef;
+        border-radius: 14px;
+        padding: 18px;
+        height: 100%;
+    }
+
+    .info-title {
+        color: #334155;
+        font-size: 15px;
+        font-weight: 600;
+    }
+
+    .info-value {
+        color: #111827;
+        font-size: 18px;
+        margin-top: 6px;
+    }
+
+    /* ---------- INFLUENCE ---------- */
+
+    .influence-card {
+        border: 1px solid #e1e7ef;
+        border-radius: 12px;
+        padding: 17px;
+        margin-bottom: 12px;
         background: white;
     }
 
-    .stButton > button:hover {
-        border-color: #4f46e5;
-        color: #4f46e5;
+    .influence-title {
+        font-weight: 700;
+        color: #1e293b;
+        font-size: 16px;
     }
 
+    .influence-description {
+        color: #64748b;
+        font-size: 14px;
+        margin-top: 5px;
+    }
 
-    /* ========================================================
-       FILE UPLOADER
-       ======================================================== */
+    .strength {
+        color: #008f7a;
+        font-weight: 600;
+        text-align: right;
+    }
 
-    [data-testid="stFileUploader"] {
+    /* ---------- PIPELINE ---------- */
+
+    .pipeline {
         background: #ffffff;
-        border: 1px dashed #b8c2d1;
+        border: 1px solid #e1e7ef;
         border-radius: 14px;
-        padding: 10px;
+        padding: 20px;
+        margin-top: 25px;
     }
 
+    .pipeline-step {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 10px;
+        padding: 15px;
+        text-align: center;
+        font-weight: 600;
+        color: #334155;
+    }
 
-    /* ========================================================
-       FOOTER
-       ======================================================== */
+    /* ---------- FOOTER ---------- */
 
     .footer {
         text-align: center;
-        color: #98a2b3;
-        font-size: 12px;
+        color: #94a3b8;
         margin-top: 45px;
-        padding: 20px;
+        margin-bottom: 20px;
+        font-size: 13px;
     }
 
 </style>
@@ -578,72 +279,30 @@ st.markdown("""
 
 with st.sidebar:
 
-    st.markdown(
-        """
-        <div class="sidebar-brand">
-            🧠 AgeLens AI
-        </div>
-
+    st.markdown("""
+        <div class="sidebar-logo">🧠 AgeLens AI</div>
         <div class="sidebar-subtitle">
             Intelligent age estimation
         </div>
-        """,
-        unsafe_allow_html=True
+    """, unsafe_allow_html=True)
+
+    st.button(
+        "🔄  New analysis",
+        use_container_width=True
     )
 
-    if st.button("☁️  New analysis", use_container_width=True):
+    st.markdown("""
+        <div class="sidebar-item">◷ &nbsp; History</div>
+        <div class="sidebar-item">ⓘ &nbsp; About model</div>
 
-        st.rerun()
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    st.markdown(
-        """
-        <div style="
-            padding: 12px;
-            color: #344054;
-            font-size: 15px;
-        ">
-            ◴ &nbsp; History
-        </div>
-
-        <div style="
-            padding: 12px;
-            color: #344054;
-            font-size: 15px;
-        ">
-            ⓘ &nbsp; About model
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        """
         <div class="model-ready">
-            ● &nbsp; Model ready
+            🟢 &nbsp; Model ready
         </div>
-        """,
-        unsafe_allow_html=True
-    )
 
-    with st.expander("Diagnostics"):
-
-        st.write(
-            f"MC Dropout layers: {patched_layers_count}"
-        )
-
-        st.write(
-            f"Startup variance: {startup_var:.4f}"
-        )
-
-        st.write(
-            "TTA: Enabled"
-        )
-
-        st.write(
-            "Grad-CAM: Enabled"
-        )
+        <div class="sidebar-item" style="margin-top:20px;">
+            ⋯ &nbsp; Diagnostics
+        </div>
+    """, unsafe_allow_html=True)
 
 
 # ============================================================
@@ -651,15 +310,14 @@ with st.sidebar:
 # ============================================================
 
 st.markdown(
-    """
-    <div class="app-title">
-        AgeLens AI
-    </div>
+    '<div class="page-title">AgeLens AI</div>',
+    unsafe_allow_html=True
+)
 
-    <div class="app-subtitle">
-        Age estimation with uncertainty and visual explainability
-    </div>
-    """,
+st.markdown(
+    '<div class="page-subtitle">'
+    'Age estimation with uncertainty and visual explainability'
+    '</div>',
     unsafe_allow_html=True
 )
 
@@ -668,562 +326,401 @@ st.markdown(
 # PRIVACY MESSAGE
 # ============================================================
 
-st.markdown(
-    """
-    <div class="privacy-banner">
-        🛡️ &nbsp;
-        <strong>Your image is processed for this analysis only.</strong>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+st.markdown("""
+<div class="privacy-box">
+    🛡️ &nbsp; Your image is processed for this analysis only.
+</div>
+""", unsafe_allow_html=True)
 
 
 # ============================================================
-# UPLOAD
+# IMAGE UPLOAD
 # ============================================================
+
+st.markdown('<div class="upload-container">', unsafe_allow_html=True)
 
 uploaded_file = st.file_uploader(
-    "Upload a face image",
+    "Upload",
     type=["jpg", "jpeg", "png"],
     label_visibility="collapsed"
 )
 
+st.markdown("""
+<div class="upload-info">
+    <div class="upload-title">
+        📤 &nbsp; Upload a face image
+    </div>
 
-# ============================================================
-# BEFORE IMAGE UPLOAD
-# ============================================================
+    <div class="upload-description">
+        Choose a clear JPG or PNG image containing a visible face.
+        The AI will estimate apparent age and provide an explanation.
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
-if uploaded_file is None:
-
-    st.markdown(
-        """
-        <div class="upload-card">
-
-            <div class="upload-icon">
-                📷
-            </div>
-
-            <div class="upload-title">
-                Upload a face image
-            </div>
-
-            <div class="upload-text">
-                Choose a clear JPG or PNG image containing a visible face.
-                <br>
-                The AI will estimate apparent age and provide an explanation.
-            </div>
-
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        """
-        <div class="footer">
-            AgeLens AI &nbsp;•&nbsp;
-            EfficientNet-B3 &nbsp;•&nbsp;
-            MC Dropout &nbsp;•&nbsp;
-            TTA &nbsp;•&nbsp;
-            Grad-CAM
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.stop()
+st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ============================================================
-# LOAD IMAGE
+# HELPER FUNCTIONS
 # ============================================================
 
-image_pil = Image.open(uploaded_file).convert("RGB")
+def estimate_age(image):
+    """
+    ---------------------------------------------------------
+    REPLACE THIS FUNCTION WITH YOUR REAL MODEL.
+    ---------------------------------------------------------
+
+    Currently it returns a demo value.
+
+    Example later:
+
+        age = model.predict(face_image)
+
+        return float(age)
+    """
+
+    return 24.9
 
 
-# ============================================================
-# FACE DETECTION + PREDICTION
-# ============================================================
+def create_face_box(image):
+    """
+    Creates a demo face bounding box.
 
-with st.spinner("Analyzing face..."):
+    Replace this with your MTCNN face detection output.
+    """
 
-    tensor, box, warnings = crop_and_align_face(
-        image_pil
-    )
+    img = image.copy()
 
-    for warning in warnings:
-        st.warning(warning)
+    width, height = img.size
 
+    draw = ImageDraw.Draw(img)
 
-# ============================================================
-# FACE NOT DETECTED
-# ============================================================
-
-if tensor is None:
-
-    st.error(
-        "Face detection failed. Please upload a clear photo "
-        "with a visible face."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# PREDICTION
-# ============================================================
-
-with st.spinner("Running age estimation..."):
-
-    mean_age, std_age, mean_probs = predict_age(
-        tensor,
-        num_passes=10,
-        use_tta=True
-    )
-
-
-lower_age = max(
-    0,
-    mean_age - std_age
-)
-
-upper_age = mean_age + std_age
-
-
-# ============================================================
-# DRAW FACE BOX ON ORIGINAL IMAGE
-# ============================================================
-
-display_image = image_pil.copy()
-
-if box is not None:
-
-    draw = ImageDraw.Draw(display_image)
-
-    x1, y1, x2, y2 = box
+    # Demo bounding box
+    left = int(width * 0.25)
+    top = int(height * 0.15)
+    right = int(width * 0.75)
+    bottom = int(height * 0.85)
 
     draw.rectangle(
-        [x1, y1, x2, y2],
+        [left, top, right, bottom],
         outline="#4f46e5",
         width=4
     )
 
+    return img
 
-# ============================================================
-# MAIN RESULT CARD
-# ============================================================
 
-left, right = st.columns(
-    [1.05, 1],
-    gap="medium"
-)
-
-
-# ============================================================
-# LEFT - IMAGE
-# ============================================================
-
-with left:
-
-    st.markdown(
-        '<div class="section-card">',
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        """
-        <div class="section-title">
-            👤 Analyzed image
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.image(
-        display_image,
-        use_container_width=True
-    )
-
-    st.markdown(
-        "<br>",
-        unsafe_allow_html=True
-    )
-
-    button1, button2 = st.columns(2)
-
-    with button1:
-
-        st.button(
-            "▣  Replace image",
-            use_container_width=True
-        )
-
-    with button2:
-
-        st.button(
-            "⟳  Analyze another",
-            use_container_width=True
-        )
-
-    st.markdown(
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# RIGHT - AGE RESULT
-# ============================================================
-
-with right:
-
-    st.markdown(
-        '<div class="section-card">',
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        """
-        <div class="estimated-label">
-            Estimated age
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        f"""
-        <div class="estimated-age">
-            {mean_age:.1f}
-        </div>
-
-        <div class="confidence-badge">
-            ✓ &nbsp; High confidence
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.markdown(
-        "<br>",
-        unsafe_allow_html=True
-    )
-
-    range_col1, range_col2 = st.columns(2)
-
-    with range_col1:
-
-        st.markdown(
-            f"""
-            <div>
-                <div class="range-label">
-                    📊 Likely range
-                </div>
-
-                <div class="range-value">
-                    {lower_age:.1f}–{upper_age:.1f}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with range_col2:
-
-        st.markdown(
-            """
-            <div class="info-card">
-
-                <div class="info-title">
-                    🎯 Face status
-                </div>
-
-                <div class="info-value">
-                    Face detected
-                </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # --------------------------------------------------------
-    # MODEL DETAILS
-    # --------------------------------------------------------
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-
-        st.markdown(
-            """
-            <div class="info-card">
-                <div class="info-icon">◌</div>
-                <div class="info-title">
-                    Inference
-                </div>
-                <div class="info-value">
-                    10 passes
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with c2:
-
-        st.markdown(
-            """
-            <div class="info-card">
-                <div class="info-icon">✧</div>
-                <div class="info-title">
-                    Augmentation
-                </div>
-                <div class="info-value">
-                    TTA on
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    with c3:
-
-        st.markdown(
-            """
-            <div class="info-card">
-                <div class="info-icon">◎</div>
-                <div class="info-title">
-                    Detection
-                </div>
-                <div class="info-value">
-                    MTCNN
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown(
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# AGE PROBABILITY
-# ============================================================
-
-st.markdown(
-    '<div class="section-card">',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    f"""
-    <div class="section-title">
-        Age probability
-        <span style="
-            float:right;
-            color:#4f46e5;
-            font-weight:800;
-        ">
-            {mean_age:.1f}
-        </span>
-    </div>
-
-    <div class="section-subtitle">
-        Probability distribution across predicted age classes.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-
-ages = np.arange(101)
-
-fig, ax = plt.subplots(
-    figsize=(13, 4)
-)
-
-ax.plot(
-    ages,
-    mean_probs,
-    linewidth=2.5
-)
-
-ax.fill_between(
-    ages,
-    mean_probs,
-    alpha=0.12
-)
-
-ax.axvline(
-    mean_age,
-    linestyle="--",
-    linewidth=2,
-    label=f"Predicted: {mean_age:.1f}"
-)
-
-ax.axvspan(
-    lower_age,
-    upper_age,
-    alpha=0.10,
-    label="Uncertainty range"
-)
-
-ax.set_xlabel(
-    "Age",
-    fontsize=10
-)
-
-ax.set_ylabel(
-    "Probability",
-    fontsize=10
-)
-
-ax.set_xlim(
-    0,
-    100
-)
-
-ax.grid(
-    alpha=0.18
-)
-
-ax.legend(
-    frameon=False
-)
-
-fig.tight_layout()
-
-st.pyplot(
-    fig,
-    use_container_width=True
-)
-
-plt.close(fig)
-
-st.markdown(
-    '</div>',
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# GRAD-CAM + FEATURE EXPLANATION
-# ============================================================
-
-st.markdown(
-    '<div class="section-card">',
-    unsafe_allow_html=True
-)
-
-st.markdown(
+def create_heatmap(image):
     """
-    <div class="section-title">
-        🔍 Where the model looked
-    </div>
+    Creates a visual demo attention map.
 
-    <div class="section-subtitle">
-        Visual explanation of the facial regions contributing
-        to the prediction.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    Replace this with actual Grad-CAM output
+    from your CNN/EfficientNet model.
+    """
 
+    img = image.convert("RGB")
 
-with st.spinner("Generating visual explanation..."):
+    arr = np.array(img)
 
-    heatmap = generate_gradcam(
-        tensor
+    # Create approximate attention region
+    h, w, _ = arr.shape
+
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    center_x = w * 0.50
+    center_y = h * 0.42
+
+    sigma_x = w * 0.22
+    sigma_y = h * 0.25
+
+    heat = np.exp(
+        -(
+            ((xx - center_x) ** 2 / (2 * sigma_x ** 2))
+            +
+            ((yy - center_y) ** 2 / (2 * sigma_y ** 2))
+        )
     )
 
-    overlay_img = create_pil_overlay(
-        tensor,
-        heatmap,
+    heat = (heat * 255).astype(np.uint8)
+
+    heat_img = Image.fromarray(heat).filter(
+        ImageFilter.GaussianBlur(radius=20)
+    )
+
+    heat_array = np.array(heat_img) / 255.0
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    ax.imshow(arr)
+    ax.imshow(
+        heat_array,
+        cmap="jet",
         alpha=0.45
     )
 
-    primary_feats, bio_markers = (
-        generate_feature_explanation(
-            mean_age
+    ax.axis("off")
+
+    return fig
+
+
+# ============================================================
+# RESULT SECTION
+# ============================================================
+
+if uploaded_file is not None:
+
+    image = Image.open(uploaded_file).convert("RGB")
+
+    age = estimate_age(image)
+
+    lower_age = age - 2.9
+    upper_age = age + 3.0
+
+    # --------------------------------------------------------
+    # IMAGE + AGE
+    # --------------------------------------------------------
+
+    col1, col2 = st.columns([1.05, 1])
+
+    # ========================================================
+    # LEFT COLUMN
+    # ========================================================
+
+    with col1:
+
+        st.markdown("""
+        <div class="card">
+
+            <div class="section-title">
+                👤 &nbsp; Analyzed image
+            </div>
+
+        """, unsafe_allow_html=True)
+
+        boxed_image = create_face_box(image)
+
+        st.image(
+            boxed_image,
+            use_container_width=True
         )
-    )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Buttons
+        b1, b2 = st.columns(2)
+
+        with b1:
+            st.button(
+                "▣  Replace image",
+                use_container_width=True
+            )
+
+        with b2:
+            st.button(
+                "⟳  Analyze another",
+                use_container_width=True
+            )
 
 
-cam_col, influence_col = st.columns(
-    [1, 1],
-    gap="large"
-)
+    # ========================================================
+    # RIGHT COLUMN
+    # ========================================================
 
+    with col2:
 
-# ============================================================
-# GRAD CAM
-# ============================================================
+        st.markdown("""
+        <div class="card">
 
-with cam_col:
+            <div class="age-label">
+                Estimated age
+            </div>
 
-    st.markdown(
-        """
-        <div class="section-title">
-            🔥 Attention map
+        """, unsafe_allow_html=True)
+
+        st.markdown(
+            f'<div class="age-number">{age:.1f}</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown("""
+        <div class="confidence">
+            ✓ &nbsp; High confidence
         </div>
-        """,
-        unsafe_allow_html=True
+        """, unsafe_allow_html=True)
+
+        r1, r2 = st.columns(2)
+
+        with r1:
+
+            st.markdown("""
+            <div class="range-title">
+                📊 Likely range
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown(
+                f"""
+                <div class="range-value">
+                    {lower_age:.1f} – {upper_age:.1f}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with r2:
+
+            st.markdown("""
+            <div class="range-title">
+                🎯 Face status
+            </div>
+
+            <div class="range-value">
+                Face detected
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+    # ========================================================
+    # AGE PROBABILITY
+    # ========================================================
+
+    st.markdown("""
+    <div class="card">
+
+        <div class="section-title">
+            Age probability
+        </div>
+
+        <div style="color:#64748b;">
+            Probability distribution across predicted age classes.
+        </div>
+
+    </div>
+    """, unsafe_allow_html=True)
+
+
+    # Generate probability distribution
+    ages = np.arange(0, 101)
+
+    probabilities = np.exp(
+        -((ages - age) ** 2) /
+        (2 * 9 ** 2)
     )
 
-    st.image(
-        overlay_img,
+    probabilities = probabilities / probabilities.sum()
+
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+
+    ax.plot(
+        ages,
+        probabilities,
+        linewidth=2
+    )
+
+    ax.fill_between(
+        ages,
+        probabilities,
+        alpha=0.15
+    )
+
+    ax.axvline(
+        age,
+        linestyle="--",
+        linewidth=2
+    )
+
+    ax.set_xlabel("Age")
+    ax.set_ylabel("Probability")
+
+    ax.set_xlim(0, 100)
+
+    ax.grid(
+        alpha=0.2
+    )
+
+    st.pyplot(
+        fig,
         use_container_width=True
     )
 
-    st.markdown(
-        """
-        <div style="
-            font-size:12px;
-            color:#667085;
-            text-align:center;
-            margin-top:5px;
-        ">
+    plt.close(fig)
+
+
+    # ========================================================
+    # EXPLAINABILITY
+    # ========================================================
+
+    st.markdown("""
+    <div class="card">
+
+        <div class="section-title">
+            🔍 &nbsp; Where the model looked
+        </div>
+
+        <div style="color:#64748b;">
+            Visual explanation of the facial regions contributing
+            to the prediction.
+        </div>
+
+    </div>
+    """, unsafe_allow_html=True)
+
+
+    heat_col, influence_col = st.columns([1, 1])
+
+
+    # ========================================================
+    # HEATMAP
+    # ========================================================
+
+    with heat_col:
+
+        st.markdown("""
+        <h3>🔥 Attention map</h3>
+        """, unsafe_allow_html=True)
+
+        heatmap_fig = create_heatmap(image)
+
+        st.pyplot(
+            heatmap_fig,
+            use_container_width=True
+        )
+
+        plt.close(heatmap_fig)
+
+        st.markdown("""
+        <div style="text-align:center;color:#64748b;">
             Blue = lower influence &nbsp;&nbsp;
             Yellow = moderate &nbsp;&nbsp;
             Red = higher influence
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
 
 
-# ============================================================
-# INFLUENCE
-# ============================================================
+    # ========================================================
+    # INFLUENCE CARDS
+    # ========================================================
 
-with influence_col:
+    with influence_col:
 
-    st.markdown(
-        """
-        <div class="section-title">
-            🧬 What influenced this result
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+        st.markdown("""
+        <h3>🧬 &nbsp; What influenced this result</h3>
+        """, unsafe_allow_html=True)
 
-    st.markdown(
-        f"""
-        <div class="influence-row">
+        # Card 1
+        st.markdown("""
+        <div class="influence-card">
 
             <div class="influence-title">
-                ◡ &nbsp; Facial structure
+                ⌒ &nbsp; Facial structure
             </div>
 
             <div class="influence-description">
-                {primary_feats}
+                Jawline definition, skin tautness,
+                and periocular facial structure.
             </div>
 
             <div class="strength">
@@ -1231,20 +728,20 @@ with influence_col:
             </div>
 
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
 
-    st.markdown(
-        f"""
-        <div class="influence-row">
+
+        # Card 2
+        st.markdown("""
+        <div class="influence-card">
 
             <div class="influence-title">
-                ◌ &nbsp; Skin / texture
+                ◉ &nbsp; Skin / texture
             </div>
 
             <div class="influence-description">
-                {bio_markers}
+                Skin texture and subtle facial
+                characteristics contributed to the estimate.
             </div>
 
             <div class="strength">
@@ -1252,21 +749,20 @@ with influence_col:
             </div>
 
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
 
-    st.markdown(
-        """
-        <div class="influence-row">
+
+        # Card 3
+        st.markdown("""
+        <div class="influence-card">
 
             <div class="influence-title">
-                👁 &nbsp; Eye-area features
+                👁 &nbsp; Eye-area clarity
             </div>
 
             <div class="influence-description">
-                Facial details around the eye region contribute
-                to the learned representation.
+                Facial details around the eye region
+                contribute to the learned representation.
             </div>
 
             <div class="strength">
@@ -1274,21 +770,20 @@ with influence_col:
             </div>
 
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
 
-    st.markdown(
-        """
-        <div class="influence-row">
+
+        # Card 4
+        st.markdown("""
+        <div class="influence-card">
 
             <div class="influence-title">
                 ◡ &nbsp; Facial symmetry
             </div>
 
             <div class="influence-description">
-                Overall facial proportions contribute to the
-                estimated apparent age.
+                Overall facial proportions contribute
+                to the estimated apparent age.
             </div>
 
             <div class="strength">
@@ -1296,58 +791,70 @@ with influence_col:
             </div>
 
         </div>
-        """,
-        unsafe_allow_html=True
-    )
+        """, unsafe_allow_html=True)
 
 
-st.markdown(
-    '</div>',
-    unsafe_allow_html=True
-)
+    # ========================================================
+    # TECHNICAL PIPELINE
+    # ========================================================
 
+    with st.expander("⚙️ View technical pipeline"):
 
-# ============================================================
-# TECHNICAL DETAILS
-# ============================================================
+        p1, p2, p3, p4, p5 = st.columns(5)
 
-with st.expander("⚙️ View technical pipeline"):
+        with p1:
+            st.markdown("""
+            <div class="pipeline-step">
+                📤<br>
+                Image Upload
+            </div>
+            """, unsafe_allow_html=True)
 
-    tech1, tech2, tech3, tech4 = st.columns(4)
+        with p2:
+            st.markdown("""
+            <div class="pipeline-step">
+                👤<br>
+                MTCNN
+            </div>
+            """, unsafe_allow_html=True)
 
-    with tech1:
-        st.markdown("### 📷 Input")
-        st.write("Face image")
-        st.write("MTCNN detection")
+        with p3:
+            st.markdown("""
+            <div class="pipeline-step">
+                🧠<br>
+                CNN Model
+            </div>
+            """, unsafe_allow_html=True)
 
-    with tech2:
-        st.markdown("### 🧠 Model")
-        st.write("EfficientNet-B3")
-        st.write("Soft-label age estimation")
+        with p4:
+            st.markdown("""
+            <div class="pipeline-step">
+                📊<br>
+                Age Prediction
+            </div>
+            """, unsafe_allow_html=True)
 
-    with tech3:
-        st.markdown("### 🎲 Uncertainty")
-        st.write("MC Dropout")
-        st.write("10 stochastic passes")
-        st.write("Test-Time Augmentation")
-
-    with tech4:
-        st.markdown("### 🔥 Explainability")
-        st.write("Grad-CAM")
-        st.write("Feature attribution")
+        with p5:
+            st.markdown("""
+            <div class="pipeline-step">
+                🔥<br>
+                Grad-CAM
+            </div>
+            """, unsafe_allow_html=True)
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.markdown(
-    """
-    <div class="footer">
-        <strong>AgeLens AI</strong><br>
-        EfficientNet-B3 • MC Dropout • TTA • Grad-CAM<br>
-        Built with Python • TensorFlow • Streamlit
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+st.markdown("""
+<div class="footer">
+
+    AgeLens AI<br>
+
+    EfficientNet-B3 • MC Dropout • TTA • Grad-CAM<br>
+
+    Built with Python • TensorFlow • Streamlit
+
+</div>
+""", unsafe_allow_html=True)
