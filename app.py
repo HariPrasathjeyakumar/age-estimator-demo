@@ -287,7 +287,6 @@ def results():
     else:
         mae_value=rmse_value=within_value="Unavailable"
         evaluation_note=evaluation.get("message","Evaluation dataset unavailable")
-    html(f'''<section class="performance-section"><div class="performance-head"><div class="eyebrow">Model Performance</div><h2>Key Metrics</h2><p>Evaluation metrics from the model validation/test results</p></div><div class="metric-grid"><div class="performance-card"><div class="performance-kicker">MAE</div><div class="performance-value">{mae_value}</div><div class="performance-label">Mean Absolute Error</div><div class="performance-help">Average prediction error · years</div></div><div class="performance-card"><div class="performance-kicker">RMSE</div><div class="performance-value">{rmse_value}</div><div class="performance-label">Root Mean Squared Error</div><div class="performance-help">Penalizes larger errors · years</div></div><div class="performance-card"><div class="performance-kicker">±5-Year Accuracy</div><div class="performance-value">{within_value}</div><div class="performance-label">Predictions within ±5 years</div><div class="performance-help">Measured on labeled evaluation data</div></div></div><p class="performance-note">{evaluation_note}</p></section>''')
     html('<div class="explain-section"><div class="section-head"><div class="eyebrow">Model Explainability</div><h2>See which facial regions received stronger model attention</h2></div></div>')
     if "cam" not in st.session_state:
         with st.spinner("Generating Grad-CAM model explanation…"):
