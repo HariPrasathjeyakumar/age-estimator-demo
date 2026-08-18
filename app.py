@@ -2,7 +2,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
 import matplotlib.pyplot as plt
-import random
+import textwrap
 
 # ============================================================
 # PAGE CONFIGURATION
@@ -14,6 +14,30 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+
+# ============================================================
+# HTML RENDER HELPER  <-- THE FIX
+# ============================================================
+# Streamlit passes st.markdown() strings through a Markdown
+# parser first. Markdown treats ANY line indented 4+ spaces as
+# an indented code block, and renders it as literal text instead
+# of parsing it as HTML - unsafe_allow_html=True does not stop
+# this, because it's not being blocked, it's being turned into
+# a valid <pre><code> block containing your tag text.
+#
+# Because Python's indentation gets baked into triple-quoted
+# strings (especially inside nested `with` blocks), every HTML
+# snippet written at a deep nesting level picks up 8-16 spaces
+# of leading whitespace on each line -> broken rendering.
+#
+# render_html() strips that indentation with textwrap.dedent()
+# and .strip() before handing the string to st.markdown(), no
+# matter how deeply the call is nested in your Python code.
+
+def render_html(html: str):
+    st.markdown(textwrap.dedent(html).strip(), unsafe_allow_html=True)
+
 
 # ============================================================
 # CUSTOM CSS
@@ -279,19 +303,19 @@ st.markdown("""
 
 with st.sidebar:
 
-    st.markdown("""
+    render_html("""
         <div class="sidebar-logo">🧠 AgeLens AI</div>
         <div class="sidebar-subtitle">
             Intelligent age estimation
         </div>
-    """, unsafe_allow_html=True)
+    """)
 
     st.button(
         "🔄  New analysis",
         use_container_width=True
     )
 
-    st.markdown("""
+    render_html("""
         <div class="sidebar-item">◷ &nbsp; History</div>
         <div class="sidebar-item">ⓘ &nbsp; About model</div>
 
@@ -302,23 +326,19 @@ with st.sidebar:
         <div class="sidebar-item" style="margin-top:20px;">
             ⋯ &nbsp; Diagnostics
         </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.markdown(
-    '<div class="page-title">AgeLens AI</div>',
-    unsafe_allow_html=True
-)
+render_html('<div class="page-title">AgeLens AI</div>')
 
-st.markdown(
+render_html(
     '<div class="page-subtitle">'
     'Age estimation with uncertainty and visual explainability'
-    '</div>',
-    unsafe_allow_html=True
+    '</div>'
 )
 
 
@@ -326,18 +346,18 @@ st.markdown(
 # PRIVACY MESSAGE
 # ============================================================
 
-st.markdown("""
+render_html("""
 <div class="privacy-box">
     🛡️ &nbsp; Your image is processed for this analysis only.
 </div>
-""", unsafe_allow_html=True)
+""")
 
 
 # ============================================================
 # IMAGE UPLOAD
 # ============================================================
 
-st.markdown('<div class="upload-container">', unsafe_allow_html=True)
+render_html('<div class="upload-container">')
 
 uploaded_file = st.file_uploader(
     "Upload",
@@ -345,7 +365,7 @@ uploaded_file = st.file_uploader(
     label_visibility="collapsed"
 )
 
-st.markdown("""
+render_html("""
 <div class="upload-info">
     <div class="upload-title">
         📤 &nbsp; Upload a face image
@@ -356,9 +376,9 @@ st.markdown("""
         The AI will estimate apparent age and provide an explanation.
     </div>
 </div>
-""", unsafe_allow_html=True)
+""")
 
-st.markdown('</div>', unsafe_allow_html=True)
+render_html('</div>')
 
 
 # ============================================================
@@ -489,14 +509,14 @@ if uploaded_file is not None:
 
     with col1:
 
-        st.markdown("""
+        render_html("""
         <div class="card">
 
             <div class="section-title">
                 👤 &nbsp; Analyzed image
             </div>
 
-        """, unsafe_allow_html=True)
+        """)
 
         boxed_image = create_face_box(image)
 
@@ -505,7 +525,7 @@ if uploaded_file is not None:
             use_container_width=True
         )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        render_html("</div>")
 
         # Buttons
         b1, b2 = st.columns(2)
@@ -529,48 +549,42 @@ if uploaded_file is not None:
 
     with col2:
 
-        st.markdown("""
+        render_html("""
         <div class="card">
 
             <div class="age-label">
                 Estimated age
             </div>
 
-        """, unsafe_allow_html=True)
+        """)
 
-        st.markdown(
-            f'<div class="age-number">{age:.1f}</div>',
-            unsafe_allow_html=True
-        )
+        render_html(f'<div class="age-number">{age:.1f}</div>')
 
-        st.markdown("""
+        render_html("""
         <div class="confidence">
             ✓ &nbsp; High confidence
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
         r1, r2 = st.columns(2)
 
         with r1:
 
-            st.markdown("""
+            render_html("""
             <div class="range-title">
                 📊 Likely range
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
-            st.markdown(
-                f"""
+            render_html(f"""
                 <div class="range-value">
                     {lower_age:.1f} – {upper_age:.1f}
                 </div>
-                """,
-                unsafe_allow_html=True
-            )
+                """)
 
         with r2:
 
-            st.markdown("""
+            render_html("""
             <div class="range-title">
                 🎯 Face status
             </div>
@@ -578,16 +592,16 @@ if uploaded_file is not None:
             <div class="range-value">
                 Face detected
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
-        st.markdown("</div>", unsafe_allow_html=True)
+        render_html("</div>")
 
 
     # ========================================================
     # AGE PROBABILITY
     # ========================================================
 
-    st.markdown("""
+    render_html("""
     <div class="card">
 
         <div class="section-title">
@@ -599,7 +613,7 @@ if uploaded_file is not None:
         </div>
 
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
     # Generate probability distribution
@@ -653,7 +667,7 @@ if uploaded_file is not None:
     # EXPLAINABILITY
     # ========================================================
 
-    st.markdown("""
+    render_html("""
     <div class="card">
 
         <div class="section-title">
@@ -666,7 +680,7 @@ if uploaded_file is not None:
         </div>
 
     </div>
-    """, unsafe_allow_html=True)
+    """)
 
 
     heat_col, influence_col = st.columns([1, 1])
@@ -678,9 +692,7 @@ if uploaded_file is not None:
 
     with heat_col:
 
-        st.markdown("""
-        <h3>🔥 Attention map</h3>
-        """, unsafe_allow_html=True)
+        render_html("<h3>🔥 Attention map</h3>")
 
         heatmap_fig = create_heatmap(image)
 
@@ -691,13 +703,13 @@ if uploaded_file is not None:
 
         plt.close(heatmap_fig)
 
-        st.markdown("""
+        render_html("""
         <div style="text-align:center;color:#64748b;">
             Blue = lower influence &nbsp;&nbsp;
             Yellow = moderate &nbsp;&nbsp;
             Red = higher influence
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
 
     # ========================================================
@@ -706,12 +718,10 @@ if uploaded_file is not None:
 
     with influence_col:
 
-        st.markdown("""
-        <h3>🧬 &nbsp; What influenced this result</h3>
-        """, unsafe_allow_html=True)
+        render_html("<h3>🧬 &nbsp; What influenced this result</h3>")
 
         # Card 1
-        st.markdown("""
+        render_html("""
         <div class="influence-card">
 
             <div class="influence-title">
@@ -728,11 +738,11 @@ if uploaded_file is not None:
             </div>
 
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
 
         # Card 2
-        st.markdown("""
+        render_html("""
         <div class="influence-card">
 
             <div class="influence-title">
@@ -749,11 +759,11 @@ if uploaded_file is not None:
             </div>
 
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
 
         # Card 3
-        st.markdown("""
+        render_html("""
         <div class="influence-card">
 
             <div class="influence-title">
@@ -770,11 +780,11 @@ if uploaded_file is not None:
             </div>
 
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
 
         # Card 4
-        st.markdown("""
+        render_html("""
         <div class="influence-card">
 
             <div class="influence-title">
@@ -791,7 +801,7 @@ if uploaded_file is not None:
             </div>
 
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
 
     # ========================================================
@@ -803,51 +813,51 @@ if uploaded_file is not None:
         p1, p2, p3, p4, p5 = st.columns(5)
 
         with p1:
-            st.markdown("""
+            render_html("""
             <div class="pipeline-step">
                 📤<br>
                 Image Upload
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
         with p2:
-            st.markdown("""
+            render_html("""
             <div class="pipeline-step">
                 👤<br>
                 MTCNN
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
         with p3:
-            st.markdown("""
+            render_html("""
             <div class="pipeline-step">
                 🧠<br>
                 CNN Model
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
         with p4:
-            st.markdown("""
+            render_html("""
             <div class="pipeline-step">
                 📊<br>
                 Age Prediction
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
         with p5:
-            st.markdown("""
+            render_html("""
             <div class="pipeline-step">
                 🔥<br>
                 Grad-CAM
             </div>
-            """, unsafe_allow_html=True)
+            """)
 
 
 # ============================================================
 # FOOTER
 # ============================================================
 
-st.markdown("""
+render_html("""
 <div class="footer">
 
     AgeLens AI<br>
@@ -857,4 +867,4 @@ st.markdown("""
     Built with Python • TensorFlow • Streamlit
 
 </div>
-""", unsafe_allow_html=True)
+""")
