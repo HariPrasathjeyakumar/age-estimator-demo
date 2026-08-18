@@ -209,79 +209,911 @@ def generate_feature_explanation(mean_age):
     return primary_features, biological_markers
 
 # ============================================================
-# USER INTERFACE
+# PROFESSIONAL USER INTERFACE
 # ============================================================
-st.set_page_config(page_title="Age Estimation AI", page_icon="👤", layout="wide")
 
-st.sidebar.header("⚙️ Model Diagnostics")
-st.sidebar.success(f"✅ MC Dropout Active\n(Patched Layers: {patched_layers_count}, Startup Var: {startup_var:.4f})")
+st.set_page_config(
+    page_title="AI Age Estimation",
+    page_icon="🧠",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-st.title("AI Age Estimation System")
-st.caption("EfficientNet-B3 DEX | MC Dropout Uncertainty | Grad-CAM Explainability")
+# ============================================================
+# CUSTOM CSS
+# ============================================================
 
-uploaded_file = st.file_uploader("Upload a face image", type=["jpg", "jpeg", "png"])
+st.markdown("""
+<style>
+
+    /* ---------- GLOBAL ---------- */
+
+    .stApp {
+        background: #f5f7fb;
+    }
+
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1400px;
+    }
+
+    /* ---------- HEADER ---------- */
+
+    .main-header {
+        background: linear-gradient(135deg, #111827, #1f2937);
+        padding: 30px 35px;
+        border-radius: 20px;
+        margin-bottom: 25px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+    }
+
+    .main-title {
+        color: white;
+        font-size: 34px;
+        font-weight: 750;
+        margin-bottom: 5px;
+    }
+
+    .main-subtitle {
+        color: #cbd5e1;
+        font-size: 16px;
+        margin-bottom: 18px;
+    }
+
+    .status-badge {
+        display: inline-block;
+        background: rgba(34,197,94,0.15);
+        color: #86efac;
+        padding: 7px 15px;
+        border-radius: 30px;
+        font-size: 13px;
+        font-weight: 600;
+        border: 1px solid rgba(34,197,94,0.3);
+    }
+
+    /* ---------- SECTION HEADINGS ---------- */
+
+    .section-title {
+        font-size: 24px;
+        font-weight: 700;
+        color: #111827;
+        margin-top: 20px;
+        margin-bottom: 6px;
+    }
+
+    .section-subtitle {
+        color: #64748b;
+        font-size: 14px;
+        margin-bottom: 18px;
+    }
+
+    /* ---------- UPLOAD CARD ---------- */
+
+    .upload-card {
+        background: white;
+        padding: 25px;
+        border-radius: 18px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 5px 20px rgba(15,23,42,0.05);
+        margin-bottom: 25px;
+    }
+
+    /* ---------- RESULT CARDS ---------- */
+
+    .metric-card {
+        background: white;
+        padding: 22px;
+        border-radius: 16px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 5px 20px rgba(15,23,42,0.05);
+        min-height: 125px;
+    }
+
+    .metric-label {
+        color: #64748b;
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.6px;
+        margin-bottom: 8px;
+    }
+
+    .metric-value {
+        color: #111827;
+        font-size: 30px;
+        font-weight: 750;
+    }
+
+    .metric-description {
+        color: #94a3b8;
+        font-size: 12px;
+        margin-top: 5px;
+    }
+
+    /* ---------- IMAGE CARD ---------- */
+
+    .image-card {
+        background: white;
+        padding: 18px;
+        border-radius: 18px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 5px 20px rgba(15,23,42,0.05);
+    }
+
+    /* ---------- INFO CARD ---------- */
+
+    .info-card {
+        background: #ffffff;
+        padding: 20px;
+        border-radius: 16px;
+        border-left: 4px solid #6366f1;
+        box-shadow: 0 5px 20px rgba(15,23,42,0.05);
+    }
+
+    .info-title {
+        font-size: 17px;
+        font-weight: 700;
+        color: #111827;
+        margin-bottom: 8px;
+    }
+
+    .info-text {
+        font-size: 14px;
+        color: #475569;
+        line-height: 1.6;
+    }
+
+    /* ---------- EXPLAINABILITY ---------- */
+
+    .explain-card {
+        background: white;
+        padding: 25px;
+        border-radius: 18px;
+        border: 1px solid #e2e8f0;
+        box-shadow: 0 5px 20px rgba(15,23,42,0.05);
+    }
+
+    .explain-title {
+        color: #111827;
+        font-size: 20px;
+        font-weight: 700;
+    }
+
+    .explain-subtitle {
+        color: #64748b;
+        font-size: 13px;
+        margin-bottom: 15px;
+    }
+
+    /* ---------- FOOTER ---------- */
+
+    .footer {
+        text-align: center;
+        color: #94a3b8;
+        font-size: 12px;
+        padding: 30px 0 10px 0;
+    }
+
+    /* ---------- STREAMLIT ELEMENTS ---------- */
+
+    div[data-testid="stFileUploader"] {
+        background: white;
+        border-radius: 15px;
+        padding: 10px;
+    }
+
+    div[data-testid="stMetric"] {
+        background: white;
+        padding: 15px;
+        border-radius: 15px;
+    }
+
+    /* ---------- BUTTON ---------- */
+
+    .stButton > button {
+        border-radius: 10px;
+        font-weight: 600;
+        padding: 10px 20px;
+    }
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown("""
+<div class="main-header">
+
+    <div class="main-title">
+        🧠 AI Age Estimation
+    </div>
+
+    <div class="main-subtitle">
+        Explainable and uncertainty-aware facial age prediction
+        using deep learning and computer vision.
+    </div>
+
+    <span class="status-badge">
+        ● MODEL READY
+    </span>
+
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# SIDEBAR - ADVANCED DIAGNOSTICS
+# ============================================================
+
+with st.sidebar:
+
+    st.markdown("## ⚙️ Model Diagnostics")
+
+    st.success("Model loaded successfully")
+
+    st.markdown("### Model Configuration")
+
+    st.write(
+        "**Architecture:** EfficientNet-B3 DEX"
+    )
+
+    st.write(
+        "**Face Detector:** MTCNN"
+    )
+
+    st.write(
+        "**Uncertainty:** MC Dropout"
+    )
+
+    st.write(
+        "**Explainability:** Grad-CAM"
+    )
+
+    st.write(
+        "**TTA:** Enabled"
+    )
+
+    st.divider()
+
+    st.markdown("### Runtime Diagnostics")
+
+    st.metric(
+        "Patched Dropout Layers",
+        patched_layers_count
+    )
+
+    st.metric(
+        "Startup Variance",
+        f"{startup_var:.4f}"
+    )
+
+
+# ============================================================
+# UPLOAD SECTION
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">📷 Upload Face Image</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="section-subtitle">'
+    'Upload a clear face image to estimate the apparent age.'
+    '</div>',
+    unsafe_allow_html=True
+)
+
+with st.container():
+
+    st.markdown(
+        '<div class="upload-card">',
+        unsafe_allow_html=True
+    )
+
+    uploaded_file = st.file_uploader(
+        "Choose an image",
+        type=["jpg", "jpeg", "png"],
+        help="Supported formats: JPG, JPEG and PNG"
+    )
+
+    st.markdown(
+        '<p style="color:#64748b;font-size:13px;">'
+        '💡 For best results, use a clear front-facing image '
+        'with good lighting.'
+        '</p>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ============================================================
+# PROCESS IMAGE
+# ============================================================
 
 if uploaded_file:
-    image_pil = Image.open(uploaded_file)
-    col1, col2 = st.columns(2)
 
-    with st.spinner("Processing face alignment and MC inference..."):
+    image_pil = Image.open(uploaded_file).convert("RGB")
+
+    with st.spinner(
+        "🔄 Detecting face and running AI inference..."
+    ):
+
         tensor, box, warnings = crop_and_align_face(image_pil)
 
-    for w in warnings:
-        st.warning(w)
+    # Display warnings
+
+    for warning in warnings:
+        st.warning(warning)
+
+    # ========================================================
+    # FACE DETECTION SUCCESS
+    # ========================================================
 
     if tensor is not None:
-        mean_age, std_age, mean_probs = predict_age(tensor, num_passes=10, use_tta=True)
 
-        with col1:
-            st.image(image_pil, caption="Uploaded Input", use_container_width=True)
+        # ----------------------------------------------------
+        # PREDICTION
+        # ----------------------------------------------------
 
-        with col2:
-            st.metric("Predicted Age", f"{mean_age:.1f} years")
-            st.metric("Uncertainty Range (±1σ)", f"{mean_age-std_age:.1f} – {mean_age+std_age:.1f} years (σ = {std_age:.2f})")
+        mean_age, std_age, mean_probs = predict_age(
+            tensor,
+            num_passes=10,
+            use_tta=True
+        )
 
-            fig, ax = plt.subplots(figsize=(6, 3))
-            ax.plot(np.arange(101), mean_probs, color='steelblue', label='Output PDF')
-            ax.axvline(mean_age, color='red', linestyle='--', label=f'Mean: {mean_age:.1f}')
-            ax.fill_between(
-                np.arange(101), mean_probs, alpha=0.25, color='steelblue',
-                where=(np.arange(101) >= mean_age-std_age) & (np.arange(101) <= mean_age+std_age),
-                label='±1σ Bounds'
+        # ----------------------------------------------------
+        # CONFIDENCE ESTIMATION
+        # ----------------------------------------------------
+
+        uncertainty_percentage = min(
+            100,
+            max(
+                0,
+                100 - (std_age / max(mean_age, 1)) * 100
             )
-            ax.set_xlabel("Age Class")
-            ax.set_ylabel("Probability")
-            ax.legend()
-            st.pyplot(fig)
-            plt.close(fig)
+        )
 
-        with st.expander("🔍 View Grad-CAM Visual Explainability & Feature Impact", expanded=True):
-            with st.spinner("Generating attention map and feature attribution..."):
-                heatmap = generate_gradcam(tensor)
-                overlay_img = create_pil_overlay(tensor, heatmap, alpha=0.45)
-                primary_feats, bio_markers = generate_feature_explanation(mean_age)
+        if uncertainty_percentage >= 85:
+            confidence_label = "HIGH"
+        elif uncertainty_percentage >= 70:
+            confidence_label = "MEDIUM"
+        else:
+            confidence_label = "LOW"
 
-            col_cam1, col_cam2 = st.columns([1, 1])
+        # ====================================================
+        # RESULT HEADER
+        # ====================================================
 
-            with col_cam1:
-                st.image(
-                    overlay_img,
-                    caption="Grad-CAM Attention Map (Red = High Model Focus)",
-                    use_container_width=True
+        st.markdown(
+            '<div class="section-title">🎯 Analysis Result</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            '<div class="section-subtitle">'
+            'AI-generated age estimation and uncertainty analysis'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        # ====================================================
+        # METRIC CARDS
+        # ====================================================
+
+        metric1, metric2, metric3 = st.columns(3)
+
+        with metric1:
+
+            st.markdown(
+                f"""
+                <div class="metric-card">
+
+                    <div class="metric-label">
+                        Predicted Age
+                    </div>
+
+                    <div class="metric-value">
+                        {mean_age:.1f} years
+                    </div>
+
+                    <div class="metric-description">
+                        Estimated apparent age
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with metric2:
+
+            st.markdown(
+                f"""
+                <div class="metric-card">
+
+                    <div class="metric-label">
+                        Confidence
+                    </div>
+
+                    <div class="metric-value">
+                        {confidence_label}
+                    </div>
+
+                    <div class="metric-description">
+                        Based on prediction stability
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with metric3:
+
+            st.markdown(
+                f"""
+                <div class="metric-card">
+
+                    <div class="metric-label">
+                        Uncertainty
+                    </div>
+
+                    <div class="metric-value">
+                        ±{std_age:.1f} years
+                    </div>
+
+                    <div class="metric-description">
+                        MC Dropout standard deviation
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+
+        # ====================================================
+        # IMAGE + SUMMARY
+        # ====================================================
+
+        image_col, summary_col = st.columns(
+            [1, 1],
+            gap="large"
+        )
+
+        # ----------------------------------------------------
+        # IMAGE
+        # ----------------------------------------------------
+
+        with image_col:
+
+            st.markdown(
+                '<div class="section-title">👤 Input Image</div>',
+                unsafe_allow_html=True
+            )
+
+            st.image(
+                image_pil,
+                use_container_width=True
+            )
+
+            if box is not None:
+
+                st.caption(
+                    "✓ Face detected and standardized "
+                    "for model inference."
                 )
 
-            with col_cam2:
-                st.markdown("### 🧬 How the Model Saw This Face")
-                st.write("Grad-CAM highlights regions where high convolution gradients contributed most to the soft-label expectation integral.")
-                
-                st.markdown("**Key Influential Regions (Red/Warm Zones):**")
-                st.markdown(f"* **Dominant Cues:** {primary_feats}")
-                st.markdown(f"* **Biological Indicators:** {bio_markers}")
-                
-                st.info(
-                    f"💡 **Model Reasoning:** For an estimated age of **{mean_age:.1f} years**, "
-                    "the neural network's final Conv2D layers heavily weighted facial geometry and dermal texture "
-                    "in the highlighted warm regions to produce this probability distribution."
+
+        # ----------------------------------------------------
+        # SUMMARY
+        # ----------------------------------------------------
+
+        with summary_col:
+
+            st.markdown(
+                '<div class="section-title">📋 Prediction Summary</div>',
+                unsafe_allow_html=True
+            )
+
+            lower_age = max(
+                0,
+                mean_age - std_age
+            )
+
+            upper_age = mean_age + std_age
+
+            st.markdown(
+                f"""
+                <div class="info-card">
+
+                    <div class="info-title">
+                        Age Estimation
+                    </div>
+
+                    <div class="info-text">
+
+                        The model estimates the apparent age
+                        of the detected face as
+
+                        <strong>{mean_age:.1f} years</strong>.
+
+                        <br><br>
+
+                        The estimated uncertainty range is
+
+                        <strong>
+                        {lower_age:.1f} – {upper_age:.1f} years
+                        </strong>.
+
+                        <br><br>
+
+                        Multiple stochastic inference passes
+                        were used to measure prediction stability.
+
+                    </div>
+
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            st.info(
+                "💡 The prediction represents an estimated "
+                "apparent age and may vary depending on image "
+                "quality, lighting, pose and facial visibility."
+            )
+
+
+        # ====================================================
+        # PROBABILITY DISTRIBUTION
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-title">'
+            '📊 Age Probability Distribution'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            '<div class="section-subtitle">'
+            'Distribution of model probability across age classes'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        age_range = np.arange(101)
+
+        fig, ax = plt.subplots(
+            figsize=(12, 4)
+        )
+
+        ax.plot(
+            age_range,
+            mean_probs,
+            linewidth=2.5,
+            label="Age Probability"
+        )
+
+        ax.axvline(
+            mean_age,
+            linestyle="--",
+            linewidth=2,
+            label=f"Predicted Age: {mean_age:.1f}"
+        )
+
+        ax.fill_between(
+            age_range,
+            mean_probs,
+            alpha=0.18,
+            where=(
+                (age_range >= mean_age - std_age) &
+                (age_range <= mean_age + std_age)
+            ),
+            label="±1σ uncertainty"
+        )
+
+        ax.set_xlabel(
+            "Age (years)",
+            fontsize=11
+        )
+
+        ax.set_ylabel(
+            "Probability",
+            fontsize=11
+        )
+
+        ax.set_xlim(
+            0,
+            100
+        )
+
+        ax.grid(
+            alpha=0.2
+        )
+
+        ax.legend(
+            frameon=False
+        )
+
+        plt.tight_layout()
+
+        st.pyplot(
+            fig,
+            use_container_width=True
+        )
+
+        plt.close(fig)
+
+
+        # ====================================================
+        # EXPLAINABLE AI
+        # ====================================================
+
+        st.markdown(
+            '<div class="section-title">'
+            '🔍 Explainable AI'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        st.markdown(
+            '<div class="section-subtitle">'
+            'Visual explanation of the regions influencing the prediction'
+            '</div>',
+            unsafe_allow_html=True
+        )
+
+        with st.spinner(
+            "Generating Grad-CAM explanation..."
+        ):
+
+            heatmap = generate_gradcam(
+                tensor
+            )
+
+            overlay_img = create_pil_overlay(
+                tensor,
+                heatmap,
+                alpha=0.45
+            )
+
+            primary_feats, bio_markers = (
+                generate_feature_explanation(
+                    mean_age
                 )
-    else:
-        st.error("Face detection failed. Please upload a clear photo with a visible face.")
+            )
+
+
+        cam_col, explanation_col = st.columns(
+            [1, 1],
+            gap="large"
+        )
+
+
+        # ----------------------------------------------------
+        # GRAD-CAM
+        # ----------------------------------------------------
+
+        with cam_col:
+
+            st.markdown(
+                '<div class="explain-card">',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                '<div class="explain-title">'
+                '🔥 Grad-CAM Attention Map'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                '<div class="explain-subtitle">'
+                'Highlighted regions indicate areas receiving '
+                'stronger model attention.'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            st.image(
+                overlay_img,
+                use_container_width=True
+            )
+
+            st.caption(
+                "Warm regions indicate stronger model activation."
+            )
+
+            st.markdown(
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+
+        # ----------------------------------------------------
+        # FEATURE EXPLANATION
+        # ----------------------------------------------------
+
+        with explanation_col:
+
+            st.markdown(
+                '<div class="explain-card">',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                '<div class="explain-title">'
+                '🧬 Model Interpretation'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                '<div class="explain-subtitle">'
+                'Feature-level interpretation of the estimated age'
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+            st.markdown(
+                "### 🎯 Dominant Facial Cues"
+            )
+
+            st.write(
+                primary_feats
+            )
+
+            st.markdown(
+                "### 🧬 Biological Indicators"
+            )
+
+            st.write(
+                bio_markers
+            )
+
+            st.markdown(
+                "### 💡 Model Reasoning"
+            )
+
+            st.info(
+                f"""
+                For an estimated age of **{mean_age:.1f} years**,
+                the neural network gives greater importance to
+                facial geometry and dermal texture represented
+                in the highlighted regions.
+                """
+            )
+
+            st.markdown(
+                '</div>',
+                unsafe_allow_html=True
+            )
+
+
+        # ====================================================
+        # TECHNICAL PIPELINE
+        # ====================================================
+
+        with st.expander(
+            "⚙️ View Technical Pipeline"
+        ):
+
+            pipeline1, pipeline2, pipeline3, pipeline4 = (
+                st.columns(4)
+            )
+
+            with pipeline1:
+                st.markdown(
+                    "**01**\n\n"
+                    "📷 **Input**\n\n"
+                    "Face image uploaded by user"
+                )
+
+            with pipeline2:
+                st.markdown(
+                    "**02**\n\n"
+                    "👤 **Detection**\n\n"
+                    "MTCNN face detection & alignment"
+                )
+
+            with pipeline3:
+                st.markdown(
+                    "**03**\n\n"
+                    "🧠 **Inference**\n\n"
+                    "EfficientNet-B3 + MC Dropout + TTA"
+                )
+
+            with pipeline4:
+                st.markdown(
+                    "**04**\n\n"
+                    "🔍 **Explanation**\n\n"
+                    "Grad-CAM feature visualization"
+                )
+
+
+# ============================================================
+# NO IMAGE STATE
+# ============================================================
+
+else:
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    empty_col1, empty_col2, empty_col3 = st.columns(
+        [1, 2, 1]
+    )
+
+    with empty_col2:
+
+        st.markdown(
+            """
+            <div style="
+                background:white;
+                padding:45px;
+                border-radius:20px;
+                text-align:center;
+                border:1px solid #e2e8f0;
+                box-shadow:0 5px 20px rgba(15,23,42,0.05);
+            ">
+
+                <div style="
+                    font-size:50px;
+                    margin-bottom:15px;
+                ">
+                    📷
+                </div>
+
+                <div style="
+                    font-size:22px;
+                    font-weight:700;
+                    color:#111827;
+                ">
+                    Ready for Analysis
+                </div>
+
+                <div style="
+                    color:#64748b;
+                    font-size:14px;
+                    margin-top:8px;
+                ">
+                    Upload a face image above to begin
+                    AI-powered age estimation.
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown(
+    """
+    <div class="footer">
+        AI Age Estimation System &nbsp;•&nbsp;
+        EfficientNet-B3 &nbsp;•&nbsp;
+        MC Dropout &nbsp;•&nbsp;
+        Grad-CAM
+        <br>
+        Built with Streamlit & TensorFlow
+    </div>
+    """,
+    unsafe_allow_html=True
+)
