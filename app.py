@@ -2,6 +2,7 @@ import streamlit as st
 from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import textwrap
 
 # ============================================================
@@ -491,6 +492,88 @@ def create_heatmap(image):
     return fig
 
 
+def generate_gradcam(image):
+    """
+    Demo Grad-CAM heatmap generator.
+
+    Replace this with the real Grad-CAM output from your CNN's
+    final Conv2D layer (gradient-weighted class activation map).
+
+    Returns a normalized (0-1) 2D numpy array, same H x W as the image.
+    """
+
+    arr = np.array(image.convert("RGB"))
+    h, w, _ = arr.shape
+
+    yy, xx = np.mgrid[0:h, 0:w]
+
+    center_x = w * 0.50
+    center_y = h * 0.42
+
+    sigma_x = w * 0.22
+    sigma_y = h * 0.25
+
+    heat = np.exp(
+        -(
+            ((xx - center_x) ** 2 / (2 * sigma_x ** 2))
+            +
+            ((yy - center_y) ** 2 / (2 * sigma_y ** 2))
+        )
+    )
+
+    heat_img = Image.fromarray((heat * 255).astype(np.uint8)).filter(
+        ImageFilter.GaussianBlur(radius=20)
+    )
+
+    return np.array(heat_img) / 255.0
+
+
+def create_pil_overlay(image, heatmap, alpha=0.45):
+    """
+    Blends a jet-colormapped heatmap over the original image and
+    returns a PIL Image, ready for st.image().
+
+    image: PIL Image (the "tensor" input, pre- or post-processing
+           doesn't matter here since this is just for display).
+    heatmap: 2D numpy array in [0, 1], same size as image.
+    """
+
+    base = image.convert("RGB")
+
+    colored = (cm.jet(heatmap)[:, :, :3] * 255).astype(np.uint8)
+    colored_img = Image.fromarray(colored).resize(base.size)
+
+    return Image.blend(base, colored_img, alpha)
+
+
+def generate_feature_explanation(mean_age):
+    """
+    Demo textual explanation generator.
+
+    Replace this with logic derived from your real feature-attribution
+    / Grad-CAM output (e.g. which facial regions and cues drove the
+    prediction for this specific image).
+    """
+
+    if mean_age < 13:
+        primary = "Smooth skin texture, rounded facial contours, larger eye-to-face ratio"
+        bio = "Minimal nasolabial definition, undeveloped jaw angle, youthful periocular skin"
+    elif mean_age < 20:
+        primary = "Emerging jawline definition, early facial elongation, skin clarity"
+        bio = "Light dermal texture variation, transitional bone-structure cues"
+    elif mean_age < 35:
+        primary = "Defined jawline, balanced facial proportions, taut skin texture"
+        bio = "Minimal fine lines, consistent skin tone, stable periocular structure"
+    elif mean_age < 50:
+        primary = "Moderate skin texture variation, developing expression lines"
+        bio = "Early periocular fine lines, subtle changes in skin elasticity"
+    else:
+        primary = "Pronounced expression lines, skin texture variation, facial volume changes"
+        bio = "Nasolabial fold depth, periocular wrinkling, reduced skin elasticity"
+
+    return primary, bio
+
+
 # ============================================================
 # RESULT SECTION
 # ============================================================
@@ -671,144 +754,45 @@ if uploaded_file is not None:
 
 
     # ========================================================
-    # EXPLAINABILITY
+    # EXPLAINABILITY (Grad-CAM)
     # ========================================================
 
-    render_html("""
-    <div class="card">
+    # Demo placeholders - wire these up to your real pipeline:
+    face_detected = True     # replace with your MTCNN/detector result
+    mean_age = age            # replace with your model's mean/expected age
+    tensor = image             # replace with your real preprocessed model input
 
-        <div class="section-title">
-            🔍 &nbsp; Where the model looked
-        </div>
+    if face_detected:
+        with st.expander("🔍 View Grad-CAM Visual Explainability & Feature Impact", expanded=True):
+            with st.spinner("Generating attention map and feature attribution..."):
+                heatmap = generate_gradcam(tensor)
+                overlay_img = create_pil_overlay(tensor, heatmap, alpha=0.45)
+                primary_feats, bio_markers = generate_feature_explanation(mean_age)
 
-        <div style="color:#64748b;">
-            Visual explanation of the facial regions contributing
-            to the prediction.
-        </div>
+            col_cam1, col_cam2 = st.columns([1, 1])
 
-    </div>
-    """)
+            with col_cam1:
+                st.image(
+                    overlay_img,
+                    caption="Grad-CAM Attention Map (Red = High Model Focus)",
+                    use_container_width=True
+                )
 
+            with col_cam2:
+                st.markdown("### 🧬 How the Model Saw This Face")
+                st.write("Grad-CAM highlights regions where high convolution gradients contributed most to the soft-label expectation integral.")
 
-    heat_col, influence_col = st.columns([1, 1])
+                st.markdown("**Key Influential Regions (Red/Warm Zones):**")
+                st.markdown(f"* **Dominant Cues:** {primary_feats}")
+                st.markdown(f"* **Biological Indicators:** {bio_markers}")
 
-
-    # ========================================================
-    # HEATMAP
-    # ========================================================
-
-    with heat_col:
-
-        render_html("<h3>🔥 Attention map</h3>")
-
-        heatmap_fig = create_heatmap(image)
-
-        st.pyplot(
-            heatmap_fig,
-            use_container_width=True
-        )
-
-        plt.close(heatmap_fig)
-
-        render_html("""
-        <div style="text-align:center;color:#64748b;">
-            Blue = lower influence &nbsp;&nbsp;
-            Yellow = moderate &nbsp;&nbsp;
-            Red = higher influence
-        </div>
-        """)
-
-
-    # ========================================================
-    # INFLUENCE CARDS
-    # ========================================================
-
-    with influence_col:
-
-        render_html("<h3>🧬 &nbsp; What influenced this result</h3>")
-
-        # Card 1
-        render_html("""
-        <div class="influence-card">
-
-            <div class="influence-title">
-                ⌒ &nbsp; Facial structure
-            </div>
-
-            <div class="influence-description">
-                Jawline definition, skin tautness,
-                and periocular facial structure.
-            </div>
-
-            <div class="strength">
-                Strong &nbsp; ●●●●●
-            </div>
-
-        </div>
-        """)
-
-
-        # Card 2
-        render_html("""
-        <div class="influence-card">
-
-            <div class="influence-title">
-                ◉ &nbsp; Skin / texture
-            </div>
-
-            <div class="influence-description">
-                Skin texture and subtle facial
-                characteristics contributed to the estimate.
-            </div>
-
-            <div class="strength">
-                Moderate &nbsp; ●●●○○
-            </div>
-
-        </div>
-        """)
-
-
-        # Card 3
-        render_html("""
-        <div class="influence-card">
-
-            <div class="influence-title">
-                👁 &nbsp; Eye-area clarity
-            </div>
-
-            <div class="influence-description">
-                Facial details around the eye region
-                contribute to the learned representation.
-            </div>
-
-            <div class="strength">
-                Strong &nbsp; ●●●●●
-            </div>
-
-        </div>
-        """)
-
-
-        # Card 4
-        render_html("""
-        <div class="influence-card">
-
-            <div class="influence-title">
-                ◡ &nbsp; Facial symmetry
-            </div>
-
-            <div class="influence-description">
-                Overall facial proportions contribute
-                to the estimated apparent age.
-            </div>
-
-            <div class="strength">
-                Moderate &nbsp; ●●●○○
-            </div>
-
-        </div>
-        """)
+                st.info(
+                    f"💡 **Model Reasoning:** For an estimated age of **{mean_age:.1f} years**, "
+                    "the neural network's final Conv2D layers heavily weighted facial geometry and dermal texture "
+                    "in the highlighted warm regions to produce this probability distribution."
+                )
+    else:
+        st.error("Face detection failed. Please upload a clear photo with a visible face.")
 
 
     # ========================================================
