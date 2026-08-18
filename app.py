@@ -280,7 +280,19 @@ def results():
                 spine.set_visible(False)
             ax.set_xlabel("Age Class",color="#a8afc6",fontsize=8); ax.set_ylabel("Probability",color="#a8afc6",fontsize=8); ax.legend(frameon=False,labelcolor="#bfc6da",fontsize=7,loc="upper right"); fig.tight_layout(); st.pyplot(fig,use_container_width=True); plt.close(fig)
 
-    
+    evaluation=evaluate_model_performance()
+    if evaluation["status"]=="available":
+        mae_value=f'{evaluation["mae"]:.2f} yrs'; rmse_value=f'{evaluation["rmse"]:.2f} yrs'; within_value=f'{evaluation["within_5"]:.2f}%'
+        evaluation_note=f'Metrics calculated from {evaluation["source"]} · {evaluation["samples"]} valid samples.'
+    else:
+        mae_value=rmse_value=within_value="Unavailable"
+        evaluation_note=evaluation.get("message","Evaluation dataset unavailable")
+    html(f'''<section class="performance-section"><div class="performance-head"><div class="eyebrow">Model Performance</div><h2>Key Metrics</h2><p>Evaluation metrics from the model validation/test results</p></div><div class="metric-grid"><div class="performance-card"><div class="performance-kicker">MAE</div><div class="performance-value">{mae_value}</div><div class="performance-label">Mean Absolute Error</div><div class="performance-help">Average prediction error · years</div></div><div class="performance-card"><div class="performance-kicker">RMSE</div><div class="performance-value">{rmse_value}</div><div class="performance-label">Root Mean Squared Error</div><div class="performance-help">Penalizes larger errors · years</div></div><div class="performance-card"><div class="performance-kicker">±5-Year Accuracy</div><div class="performance-value">{within_value}</div><div class="performance-label">Predictions within ±5 years</div><div class="performance-help">Measured on labeled evaluation data</div></div></div><p class="performance-note">{evaluation_note}</p></section>''')
+    html('<div class="explain-section"><div class="section-head"><div class="eyebrow">Model Explainability</div><h2>See which facial regions received stronger model attention</h2></div></div>')
+    if "cam" not in st.session_state:
+        with st.spinner("Generating Grad-CAM model explanation…"):
+            heat=generate_gradcam(st.session_state.tensor); original,cam,overlay=cam_images(st.session_state.tensor,heat)
+            def pack(img): out=io.BytesIO(); img.save(out,"PNG"); return out.getvalue()
             st.session_state.cam=pack(cam); st.session_state.overlay=pack(overlay)
     original=Image.open(io.BytesIO(st.session_state.original)); cam=Image.open(io.BytesIO(st.session_state.cam)); overlay=Image.open(io.BytesIO(st.session_state.overlay))
     cam_cols=st.columns(3,gap="medium")
